@@ -1,0 +1,16 @@
+[package]
+name = "grpc-webnext-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared grpc-webnext wire codec and gRPC-semantics translation core."
+
+[dependencies]
+prost = "0.14"
+bytes = "1"
+thiserror = "2"
+tonic = { version = "0.14.6", default-features = false }
+
+[build-dependencies]
+prost-build = "0.14"

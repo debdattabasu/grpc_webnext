@@ -1,0 +1,18 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,12 @@
+[package]
+name = "devserver"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Dev harness: runs testecho behind grpc-webnext-proxy; prints the proxy address."
+
+[dependencies]
+grpc-webnext-proxy = { path = "../proxy" }
+testecho = { path = "../testecho" }
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package grpc.webnext.v1;
+
+// ============================================================================
+// grpc-webnext WebSocket wire format.
+//
+// Rules (see PROTOCOL.md):
+//   * Exactly one Frame per WebSocket message. No fragmentation.
+//   * stream_id identifies a logical gRPC call. It is present on every stream
+//     frame so that single-WS-per-stream and multiplexed-pool modes share one
+//     wire format. In single-stream mode it is still set (typically 1).
+//   * No capability negotiation: if a server has a feature disabled and a
+//     client opens a new stream that needs it, the server answers with Reset.
+// ============================================================================
+
+// A single WebSocket message. Exactly one field of `kind` is set.
+message Frame {
+  oneof kind {
+    Subscribe subscribe = 1;   // open a stream (client -> server)
+    Message   message   = 2;   // one gRPC message, either direction
+    HalfClose half_close = 3;  // client done sending (client -> server)
+    Trailer   trailer   = 4;   // stream end + status (server -> client)
+    Reset     reset     = 5;   // abort a single stream, either direction
+    Ping      ping      = 6;   // app-level keepalive
+    Pong      pong      = 7;
+    Header    header    = 8;   // initial response metadata (server -> client)
+  }
+}
+
+// One metadata entry. Binary values (keys ending in "-bin") use `bin_value`.
+message Metadatum {
+  string key = 1;
+  oneof value {
+    string ascii_value = 2;
+    bytes  bin_value   = 3;
+  }
+}
+
+// Open a new logical stream on this WebSocket. First frame of every call.
+message Subscribe {
+  uint32 stream_id = 1;              // unique per WebSocket, client-allocated
+  string method = 2;                 // e.g. "/pkg.Service/Method"
+  repeated Metadatum headers = 3;    // request metadata
+  uint32 timeout_millis = 4;         // gRPC deadline; 0 = none
+  bytes  initial_payload = 5;        // optional first message (unary-style)
+}
+
+// Initial response metadata, sent once before the first Message (if any).
+message Header {
+  uint32 stream_id = 1;
+  repeated Metadatum headers = 2;
+}
+
+message Message {
+  uint32 stream_id = 1;
+  bytes  payload   = 2;              // a single encoded gRPC message
+}
+
+message HalfClose {
+  uint32 stream_id = 1;
+}
+
+// Stream completed. Carries gRPC status and trailing metadata.
+message Trailer {
+  uint32 stream_id = 1;
+  uint32 status_code = 2;            // gRPC status code (0 = OK)
+  string status_message = 3;
+  repeated Metadatum trailers = 4;
+}
+
+// Abort one stream without affecting the rest of the WebSocket. Also used by
+// the server to reject a stream (e.g. feature disabled) — no prior negotiation.
+message Reset {
+  uint32 stream_id = 1;
+  uint32 status_code = 2;            // gRPC status code (e.g. CANCELLED, UNIMPLEMENTED)
+  string status_message = 3;
+}
+
+message Ping { bytes payload = 1; }
+message Pong { bytes payload = 1; }
