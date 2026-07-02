@@ -242,6 +242,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-greeter-server"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "futures",
+ "grpc-webnext-server",
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

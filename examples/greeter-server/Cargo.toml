@@ -1,0 +1,20 @@
+[package]
+name = "example-greeter-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Example: a Greeter service served over grpc-webnext (native server) + native gRPC on one port."
+
+[dependencies]
+grpc-webnext-server = { path = "../../crates/server" }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+futures = "0.3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

@@ -6,6 +6,7 @@ members = [
     "crates/server",
     "crates/testecho",
     "crates/devserver",
+    "examples/greeter-server",
 ]
 
 [workspace.package]
