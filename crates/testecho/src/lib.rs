@@ -15,7 +15,7 @@ use pb::echo_server::{Echo, EchoServer};
 use pb::{EchoRequest, EchoResponse};
 
 #[derive(Default)]
-struct EchoSvc;
+pub struct EchoSvc;
 
 #[tonic::async_trait]
 impl Echo for EchoSvc {

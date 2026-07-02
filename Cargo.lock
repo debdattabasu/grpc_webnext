@@ -406,6 +406,7 @@ name = "grpc-webnext-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "http",
  "prost",
  "prost-build",
  "thiserror",
@@ -433,6 +434,29 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "grpc-webnext-server"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "grpc-webnext-core",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-tungstenite",
+ "hyper-util",
+ "prost",
+ "reqwest",
+ "testecho",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tonic",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

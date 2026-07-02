@@ -27,6 +27,22 @@ connection/semantics details are still stubbed:
   (README point 9) is not wired.
 - [ ] **Map cleanup edge cases / max-concurrent-streams cap per WS.**
 
+## Native server library
+
+Serves native gRPC pass-through + grpc-webnext unary + streaming on one port,
+backed by a tonic `Routes`. Deferred:
+
+- [ ] **`+json` is binary-only (UNIMPLEMENTED).** Same reason as the proxy: the
+  inner tonic router speaks binary protobuf, so JSON needs either a JSON-capable
+  codec registered on the services or descriptor-based transcoding.
+- [ ] **Graceful shutdown / drain** is not wired (serve loop runs until dropped).
+- [ ] **Per-WS max-concurrent-streams cap** and idle cleanup.
+- [ ] **Unary buffers the whole response** before framing (fine for unary; matches
+  the Fetch contract).
+- Note: deadlines *are* enforced here (grpc-timeout is forwarded and the inner
+  tonic server honors it), and client cancellation drops the inner call future —
+  both stronger than the proxy today.
+
 ## Protocol
 
 - [ ] **Ping/Pong keepalive** frames are defined but not driven by a timer yet.

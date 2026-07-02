@@ -11,6 +11,7 @@ prost = "0.14"
 bytes = "1"
 thiserror = "2"
 tonic = { version = "0.14.6", default-features = false }
+http = "1"
 
 [build-dependencies]
 prost-build = "0.14"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/proxy",
+    "crates/server",
     "crates/testecho",
     "crates/devserver",
 ]
