@@ -35,7 +35,10 @@ export class ClientReadableStream<Res> extends Emitter<ReadableEvents<Res>> {
   private readonly buffer: Res[] = [];
   private ended = false;
   private errored: ServiceError | null = null;
-  private waiter: ((r: IteratorResult<Res>) => void) | null = null;
+  private waiter: {
+    resolve: (r: IteratorResult<Res>) => void;
+    reject: (e: unknown) => void;
+  } | null = null;
 
   constructor(private readonly canceller: () => void) {
     super();
@@ -52,7 +55,7 @@ export class ClientReadableStream<Res> extends Emitter<ReadableEvents<Res>> {
     if (this.waiter) {
       const w = this.waiter;
       this.waiter = null;
-      w({ value: m, done: false });
+      w.resolve({ value: m, done: false });
     } else {
       this.buffer.push(m);
     }
@@ -60,8 +63,10 @@ export class ClientReadableStream<Res> extends Emitter<ReadableEvents<Res>> {
   private finish(): void {
     this.ended = true;
     if (this.waiter) {
-      this.waiter({ value: undefined, done: true });
+      const w = this.waiter;
       this.waiter = null;
+      if (this.errored) w.reject(this.errored);
+      else w.resolve({ value: undefined, done: true });
     }
   }
   private fail(e: ServiceError): void {
@@ -72,12 +77,13 @@ export class ClientReadableStream<Res> extends Emitter<ReadableEvents<Res>> {
   [Symbol.asyncIterator](): AsyncIterator<Res> {
     return {
       next: (): Promise<IteratorResult<Res>> => {
-        if (this.errored) return Promise.reject(this.errored);
+        // Deliver any buffered messages before surfacing an error/end.
         if (this.buffer.length) {
           return Promise.resolve({ value: this.buffer.shift() as Res, done: false });
         }
+        if (this.errored) return Promise.reject(this.errored);
         if (this.ended) return Promise.resolve({ value: undefined, done: true });
-        return new Promise((resolve) => (this.waiter = resolve));
+        return new Promise((resolve, reject) => (this.waiter = { resolve, reject }));
       },
     };
   }

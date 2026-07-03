@@ -6,6 +6,7 @@ import {
   RequestCallback,
   statusToError,
 } from "./call.js";
+import { CallContext, createCallContext, statusForAbort } from "./context.js";
 import { FetchTransport } from "./fetch-transport.js";
 import { Metadata } from "./metadata.js";
 import { ServiceError, Status } from "./status.js";
@@ -20,6 +21,9 @@ export interface CallOptions {
   signal?: AbortSignal;
 }
 
+/** Wire codec for application messages. */
+export type Codec = "proto" | "json";
+
 export interface ClientOptions {
   /** Base URL, e.g. "http://localhost:8080" or "https://api.example.com". */
   baseUrl: string;
@@ -27,6 +31,8 @@ export interface ClientOptions {
   /** Override the WebSocket constructor (node needs the `ws` package). */
   webSocketImpl?: typeof WebSocket;
   fetch?: typeof fetch;
+  /** Message codec: binary protobuf (default) or JSON. */
+  codec?: Codec;
 }
 
 type Serialize<T> = (value: T) => Uint8Array;
@@ -46,10 +52,12 @@ export class Client {
       baseUrl: options.baseUrl,
       maxMessageBytes: options.maxMessageBytes,
       fetch: options.fetch,
+      codec: options.codec,
     });
     this.streamTransport = new WebSocketTransport({
       baseUrl: options.baseUrl,
       webSocketImpl: options.webSocketImpl,
+      codec: options.codec,
     });
   }
 
@@ -67,20 +75,23 @@ export class Client {
     options: CallOptions,
     callback: RequestCallback<Res>,
   ): ClientUnaryCall {
-    const controller = new AbortController();
-    const call = new ClientUnaryCall(() => controller.abort());
-    const opts = toTransportOptions(metadata, options, controller.signal);
+    const ctx = createCallContext(options?.deadline, options?.signal);
+    const call = new ClientUnaryCall(() => ctx.abort());
 
     this.unaryTransport
-      .unary(path, serialize(argument), opts)
+      .unary(path, serialize(argument), transportOptions(metadata, ctx))
       .then((res) => {
+        ctx.dispose();
         call.emit("metadata", res.headers);
         call.emit("status", res.status);
         const err = statusToError(res.status);
         if (err) callback(err);
         else callback(null, deserialize(res.message));
       })
-      .catch((e) => callback(abortToError(e)));
+      .catch((e) => {
+        ctx.dispose();
+        callback(errorForFailure(ctx.signal, e));
+      });
 
     return call;
   }
@@ -93,11 +104,12 @@ export class Client {
     metadata: Metadata,
     options: CallOptions,
   ): ClientReadableStream<Res> {
+    const ctx = createCallContext(options?.deadline, options?.signal);
     let stream!: ClientReadableStream<Res>;
     const call = this.streamTransport.startStream(
       path,
-      toTransportOptions(metadata, options),
-      streamHandlers(() => stream, deserialize),
+      transportOptions(metadata, ctx),
+      streamHandlers(() => stream, deserialize, ctx),
     );
     stream = new ClientReadableStream<Res>(() => call.cancel());
     call.send(serialize(argument));
@@ -113,12 +125,14 @@ export class Client {
     options: CallOptions,
     callback: RequestCallback<Res>,
   ): ClientWritableStream<Req> {
+    const ctx = createCallContext(options?.deadline, options?.signal);
     let last: Res | undefined;
-    const call = this.streamTransport.startStream(path, toTransportOptions(metadata, options), {
+    const call = this.streamTransport.startStream(path, transportOptions(metadata, ctx), {
       onMessage: (bytes) => {
         last = deserialize(bytes);
       },
       onStatus: (status) => {
+        ctx.dispose();
         const err = statusToError(status);
         if (err) callback(err);
         else callback(null, last);
@@ -134,11 +148,12 @@ export class Client {
     metadata: Metadata,
     options: CallOptions,
   ): ClientDuplexStream<Req, Res> {
+    const ctx = createCallContext(options?.deadline, options?.signal);
     let stream!: ClientDuplexStream<Req, Res>;
     const call = this.streamTransport.startStream(
       path,
-      toTransportOptions(metadata, options),
-      streamHandlers(() => stream, deserialize),
+      transportOptions(metadata, ctx),
+      streamHandlers(() => stream, deserialize, ctx),
     );
     stream = new ClientDuplexStream<Req, Res>(call, serialize);
     return stream;
@@ -148,11 +163,13 @@ export class Client {
 function streamHandlers<Res>(
   getStream: () => ClientReadableStream<Res>,
   deserialize: Deserialize<Res>,
+  ctx: CallContext,
 ) {
   return {
     onHeaders: (metadata: Metadata) => getStream().emit("metadata", metadata),
     onMessage: (bytes: Uint8Array) => getStream().emit("data", deserialize(bytes)),
     onStatus: (status: StatusResult) => {
+      ctx.dispose();
       const stream = getStream();
       stream.emit("status", status);
       const err = statusToError(status);
@@ -162,28 +179,21 @@ function streamHandlers<Res>(
   };
 }
 
-function toTransportOptions(
-  metadata: Metadata,
-  options: CallOptions,
-  signal?: AbortSignal,
-): TransportCallOptions {
+function transportOptions(metadata: Metadata, ctx: CallContext): TransportCallOptions {
   return {
     metadata: metadata ?? new Metadata(),
-    timeoutMillis: resolveTimeout(options?.deadline),
-    signal: signal ?? options?.signal,
+    timeoutMillis: ctx.timeoutMillis,
+    signal: ctx.signal,
   };
 }
 
-function resolveTimeout(deadline?: Date | number): number | undefined {
-  if (deadline === undefined) return undefined;
-  const ms = (deadline instanceof Date ? deadline.getTime() : deadline) - Date.now();
-  return ms > 0 ? ms : 1;
-}
-
-function abortToError(e: unknown): ServiceError {
-  const isAbort = e instanceof Error && e.name === "AbortError";
-  return new ServiceError(
-    isAbort ? Status.CANCELLED : Status.UNKNOWN,
-    e instanceof Error ? e.message : String(e),
-  );
+/** Map a transport failure to a ServiceError. An aborted signal means the call
+ * was cancelled or timed out (fetch rejects with the abort reason, not always an
+ * AbortError), so classify by the signal, not the error shape. */
+function errorForFailure(signal: AbortSignal, e: unknown): ServiceError {
+  if (signal.aborted) {
+    const status = statusForAbort(signal);
+    return new ServiceError(status.code, status.details);
+  }
+  return new ServiceError(Status.UNKNOWN, e instanceof Error ? e.message : String(e));
 }

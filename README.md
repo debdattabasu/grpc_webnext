@@ -26,14 +26,15 @@ All three deliverables work end-to-end, covered by integration tests
 
 | Deliverable | Crate / package | State |
 |---|---|---|
-| Rust proxy — front any gRPC server | [`grpc-webnext-proxy`](crates/proxy) | ✅ unary + streaming |
+| Rust proxy — front any gRPC server | [`grpc-webnext-proxy`](crates/proxy) | ✅ unary + streaming, native gRPC same-port, deadlines, cancel |
 | Native Rust server — wrap a tonic `Router` | [`grpc-webnext-server`](crates/server) | ✅ + native gRPC same-port |
 | TypeScript client — browser + Node | [`@grpc-webnext/client`](clients/typescript) | ✅ Fetch + WebSocket, typed codegen |
 | Shared wire codec & translation | [`grpc-webnext-core`](crates/core) | ✅ |
 
-Binary protobuf is fully wired. JSON, and the remaining connection-management
-polish (retry, independent deadline timers, cancellation propagation in the
-proxy) are tracked in [BACKLOG.md](BACKLOG.md).
+Binary protobuf and JSON are both wired. Deadlines (local + forwarded),
+cancellation propagation, and unary retry are done on the proxy; JSON transcoding
+is served by the native library. Remaining polish (streaming retry, backpressure,
+JSON-in-the-proxy) is tracked in [BACKLOG.md](BACKLOG.md).
 
 ## Quickstart
 
@@ -43,17 +44,25 @@ Run the full demo (starts the native Rust server, drives it from the TS client):
 cd clients/typescript && npm install && npm run demo
 ```
 
-Use the client in your own code:
+Use the client in your own code. Two flavors share one transport:
 
 ```ts
-import { makeClient, Metadata } from "@grpc-webnext/client";
+import { makeClient, makePromiseClient, Metadata } from "@grpc-webnext/client";
 import { GreeterDefinition } from "./gen/greeter.js"; // ts-proto generic-definitions
 
-const client = makeClient(GreeterDefinition, { baseUrl: "https://api.example.com" });
-
-client.sayHello({ name: "world" }, (err, reply) => console.log(reply.message)); // Fetch
-const ticks = client.countdown({ from: 3 });                                    // WebSocket
+// Callback / EventEmitter (mirrors @grpc/grpc-js)
+const cb = makeClient(GreeterDefinition, { baseUrl: "https://api.example.com" });
+cb.sayHello({ name: "world" }, (err, reply) => console.log(reply.message)); // Fetch
+const ticks = cb.countdown({ from: 3 });                                    // WebSocket
 for await (const t of ticks) console.log(t.value);
+
+// Promise / async-iterable (mirrors Connect / nice-grpc)
+// (pass `codec: "json"` to send messages as JSON instead of binary protobuf)
+const rpc = makePromiseClient(GreeterDefinition, { baseUrl: "https://api.example.com" });
+const reply = await rpc.sayHello({ name: "world" });          // unary -> Promise
+for await (const t of rpc.countdown({ from: 3 })) log(t);     // server-stream -> AsyncIterable
+const sum = await rpc.concat(source);                         // client-stream -> Promise
+for await (const m of rpc.chat(source, { signal })) log(m);   // bidi, cancel via AbortSignal
 ```
 
 Front an existing gRPC server with the proxy:
@@ -77,7 +86,13 @@ grpc_webnext_server::serve(listener, routes, Default::default()).await?;
   (`Subscribe` / `Message` / `HalfClose` / `Trailer` / `Reset` / `Header`), no
   fragmentation. Optional client-side multiplexing of many streams over a pool.
 - **Same port.** `content-type` disambiguates `application/grpc` from
-  `application/grpc-webnext+proto`; WebSocket arrives as an HTTP/1.1 upgrade.
+  `application/grpc-webnext+proto`; WebSocket arrives as an HTTP/1.1 upgrade. Both
+  the proxy and the native server forward native `application/grpc` untouched, so
+  browsers and existing gRPC clients share one endpoint.
+- **Deadlines & cancellation.** The client sends `grpc-timeout`; the proxy enforces
+  it locally (dropping the call, which cancels the upstream) and forwards it
+  downstream. A client `Reset`/disconnect propagates to the upstream as a stream
+  reset.
 - **Schema-agnostic proxy.** A passthrough `BytesCodec` forwards message bytes
   without needing the `.proto`.
 

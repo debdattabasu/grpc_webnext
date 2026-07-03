@@ -1,3 +1,4 @@
+import { statusForAbort } from "./context.js";
 import { decodeFrame, encodeFrame } from "./frame.js";
 import { Metadata } from "./metadata.js";
 import { Status } from "./status.js";
@@ -17,6 +18,8 @@ export interface WebSocketTransportOptions {
   poolSize?: number;
   /** Override the WebSocket constructor (node needs the `ws` package). */
   webSocketImpl?: typeof WebSocket;
+  /** Message codec: "proto" (default) or "json". Sets `Subscribe.json`. */
+  codec?: "proto" | "json";
 }
 
 /** Streaming transport over WebSocket, with a client-side multiplex pool. */
@@ -25,11 +28,13 @@ export class WebSocketTransport implements Transport {
   private readonly WS: typeof WebSocket;
   private readonly pool: Conn[] = [];
   private readonly poolSize: number;
+  private readonly json: boolean;
   private next = 0;
 
   constructor(options: WebSocketTransportOptions) {
     this.url = toWsUrl(options.baseUrl);
     this.poolSize = Math.max(1, options.poolSize ?? 1);
+    this.json = options.codec === "json";
     const impl = options.webSocketImpl ?? (globalThis as any).WebSocket;
     if (!impl) {
       throw new Error(
@@ -55,7 +60,7 @@ export class WebSocketTransport implements Transport {
 
   private pickConn(): Conn {
     if (this.pool.length < this.poolSize) {
-      const conn = new Conn(this.url, this.WS);
+      const conn = new Conn(this.url, this.WS, this.json);
       this.pool.push(conn);
       return conn;
     }
@@ -69,11 +74,17 @@ export class WebSocketTransport implements Transport {
 class Conn {
   private readonly ws: WebSocket;
   private readonly streams = new Map<number, StreamHandlers>();
-  private readonly pending: Uint8Array[] = [];
+  private readonly pending: (string | Uint8Array)[] = [];
+  private readonly enc = new TextEncoder();
+  private readonly dec = new TextDecoder();
   private open_ = false;
   private nextStreamId = 1;
 
-  constructor(url: string, WS: typeof WebSocket) {
+  constructor(
+    url: string,
+    WS: typeof WebSocket,
+    private readonly json: boolean,
+  ) {
     this.ws = new WS(url);
     this.ws.binaryType = "arraybuffer";
     this.ws.addEventListener("open", () => {
@@ -90,29 +101,55 @@ class Conn {
     const streamId = this.nextStreamId++;
     this.streams.set(streamId, handlers);
 
-    this.sendFrame(
-      encodeFrame({
-        subscribe: {
-          streamId,
-          method: path,
-          headers: options.metadata.toMetadatumList(),
-          timeoutMillis: options.timeoutMillis ? Math.ceil(options.timeoutMillis) : 0,
-          initialPayload: new Uint8Array(),
-        },
-      }),
-    );
+    const timeoutMillis = options.timeoutMillis ? Math.ceil(options.timeoutMillis) : 0;
+    if (this.json) {
+      // Flat open frame: has `method`.
+      const frame: Record<string, unknown> = { streamId, method: path };
+      const metadata = metaToJson(options.metadata);
+      if (Object.keys(metadata).length) frame.metadata = metadata;
+      if (timeoutMillis) frame.timeoutMillis = timeoutMillis;
+      this.sendRaw(JSON.stringify(frame));
+    } else {
+      this.sendRaw(
+        encodeFrame({
+          subscribe: {
+            streamId,
+            method: path,
+            headers: options.metadata.toMetadatumList(),
+            timeoutMillis,
+            initialPayload: new Uint8Array(),
+            json: false,
+          },
+        }),
+      );
+    }
+
+    // Terminate the stream: send a Reset and deliver the status locally so
+    // consumers (for-await) stop.
+    const terminate = (status: StatusResult) => {
+      const handlers = this.streams.get(streamId);
+      if (!handlers) return; // already finished/cancelled
+      this.streams.delete(streamId);
+      this.sendRaw(this.encodeReset(streamId, status));
+      handlers.onStatus?.(status);
+    };
+
+    const cancel = () =>
+      terminate({ code: Status.CANCELLED, details: "cancelled", metadata: new Metadata() });
+
+    // AbortSignal -> Reset (the call's `context`). Deadline aborts report
+    // DEADLINE_EXCEEDED; any other abort is CANCELLED.
+    const signal = options.signal;
+    if (signal) {
+      const onAbort = () => terminate(statusForAbort(signal));
+      if (signal.aborted) queueMicrotask(onAbort);
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     return {
-      send: (message) => this.sendFrame(encodeFrame({ message: { streamId, payload: message } })),
-      halfClose: () => this.sendFrame(encodeFrame({ halfClose: { streamId } })),
-      cancel: () => {
-        this.sendFrame(
-          encodeFrame({
-            reset: { streamId, statusCode: Status.CANCELLED, statusMessage: "cancelled" },
-          }),
-        );
-        this.streams.delete(streamId);
-      },
+      send: (message) => this.sendRaw(this.encodeMessage(streamId, message)),
+      halfClose: () => this.sendRaw(this.encodeHalfClose(streamId)),
+      cancel,
     };
   }
 
@@ -124,20 +161,43 @@ class Conn {
     }
   }
 
-  private sendFrame(frame: Uint8Array): void {
+  private sendRaw(frame: string | Uint8Array): void {
     if (this.open_) this.ws.send(frame);
     else this.pending.push(frame);
   }
 
+  private encodeMessage(streamId: number, message: Uint8Array): string | Uint8Array {
+    if (this.json) {
+      return JSON.stringify({ streamId, message: JSON.parse(this.dec.decode(message)) });
+    }
+    return encodeFrame({ message: { streamId, payload: message } });
+  }
+
+  private encodeHalfClose(streamId: number): string | Uint8Array {
+    return this.json
+      ? JSON.stringify({ streamId, halfClose: true })
+      : encodeFrame({ halfClose: { streamId } });
+  }
+
+  private encodeReset(streamId: number, status: StatusResult): string | Uint8Array {
+    return this.json
+      ? JSON.stringify({ streamId, status: { code: status.code, message: status.details } })
+      : encodeFrame({ reset: { streamId, statusCode: status.code, statusMessage: status.details } });
+  }
+
   private onMessage(ev: MessageEvent): void {
     const data = ev.data;
+    if (typeof data === "string") {
+      this.onJsonFrame(data);
+      return;
+    }
     const bytes =
       data instanceof ArrayBuffer
         ? new Uint8Array(data)
         : ArrayBuffer.isView(data)
           ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
           : null;
-    if (!bytes) return; // ignore text frames
+    if (!bytes) return;
     const frame = decodeFrame(bytes);
 
     if (frame.header) {
@@ -160,6 +220,31 @@ class Conn {
         details: r.statusMessage,
         metadata: new Metadata(),
       });
+    }
+  }
+
+  /** Handle an inbound JSON text frame (the `+json` codec). */
+  private onJsonFrame(text: string): void {
+    let jf: any;
+    try {
+      jf = JSON.parse(text);
+    } catch {
+      return;
+    }
+    const streamId: number = jf.streamId;
+    if (jf.status) {
+      // Terminal: trailer / reset.
+      this.deliverStatus(streamId, {
+        code: jf.status.code as Status,
+        details: jf.status.message ?? "",
+        metadata: jsonToMeta(jf.metadata),
+      });
+    } else if (jf.message !== undefined) {
+      // Re-serialize the native JSON message to bytes for the deserializer.
+      this.streams.get(streamId)?.onMessage?.(this.enc.encode(JSON.stringify(jf.message)));
+    } else if (jf.metadata) {
+      // Initial response metadata (header).
+      this.streams.get(streamId)?.onHeaders?.(jsonToMeta(jf.metadata));
     }
   }
 
@@ -188,4 +273,20 @@ function toWsUrl(baseUrl: string): string {
   const url = new URL(baseUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+/** Metadata -> JSON object (ASCII values only) for a JSON frame. */
+function metaToJson(md: Metadata): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(md.getMap())) {
+    if (typeof v === "string") out[k] = v;
+  }
+  return out;
+}
+
+/** JSON object -> Metadata. */
+function jsonToMeta(obj?: Record<string, string>): Metadata {
+  const md = new Metadata();
+  for (const [k, v] of Object.entries(obj ?? {})) md.set(k, v);
+  return md;
 }

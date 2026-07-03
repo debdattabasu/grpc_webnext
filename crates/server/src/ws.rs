@@ -9,8 +9,11 @@ use std::convert::Infallible;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use std::sync::Arc;
+
+use grpc_webnext_core::json_frame::{decode_json_frame, encode_json_frame, json_frame_to_proto, proto_frame_to_json};
 use grpc_webnext_core::pb::{frame::Kind, Frame, Header, Message as WsMessage, Reset, Trailer};
-use grpc_webnext_core::{decode_frame, encode_frame, grpc_frame, metadata, Deframer};
+use grpc_webnext_core::{decode_frame, encode_frame, grpc_frame, metadata, Deframer, Transcoder};
 use http::uri::PathAndQuery;
 use http::{HeaderMap, Request};
 use http_body_util::{BodyExt, StreamBody};
@@ -31,7 +34,8 @@ struct StreamState {
     task: tokio::task::JoinHandle<()>,
 }
 
-pub async fn serve(routes: Routes, websocket: HyperWebsocket, _config: ServerConfig) {
+pub async fn serve(routes: Routes, websocket: HyperWebsocket, config: ServerConfig) {
+    let transcoder = config.transcoder.clone();
     let ws = match websocket.await {
         Ok(ws) => ws,
         Err(e) => {
@@ -41,18 +45,23 @@ pub async fn serve(routes: Routes, websocket: HyperWebsocket, _config: ServerCon
     };
     let (mut ws_sink, mut ws_stream) = ws.split();
 
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Frame>(64);
+    // The outbound channel carries ready-to-send WebSocket messages so each
+    // stream can pick its codec (text JSON vs binary protobuf).
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<TungMessage>(64);
     let (done_tx, mut done_rx) = mpsc::channel::<u32>(64);
 
     let writer = tokio::spawn(async move {
-        while let Some(frame) = outbound_rx.recv().await {
-            if ws_sink.send(TungMessage::Binary(encode_frame(&frame))).await.is_err() {
+        while let Some(msg) = outbound_rx.recv().await {
+            if ws_sink.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
     let mut streams: HashMap<u32, StreamState> = HashMap::new();
+    // The connection is locked to a codec by its first frame: text -> JSON,
+    // binary -> protobuf. Later frames of the other type are dropped.
+    let mut codec: Option<bool> = None;
 
     loop {
         tokio::select! {
@@ -60,14 +69,29 @@ pub async fn serve(routes: Routes, websocket: HyperWebsocket, _config: ServerCon
             incoming = ws_stream.next() => {
                 let Some(incoming) = incoming else { break };
                 let msg = match incoming { Ok(m) => m, Err(_) => break };
-                match msg {
+                let (frame, json) = match msg {
                     TungMessage::Binary(data) => {
-                        let Ok(frame) = decode_frame(&data) else { continue };
-                        handle_frame(frame, &routes, &outbound_tx, &done_tx, &mut streams).await;
+                        if *codec.get_or_insert(false) {
+                            continue; // locked to JSON/text
+                        }
+                        match decode_frame(&data) {
+                            Ok(f) => (f, false),
+                            Err(_) => continue,
+                        }
+                    }
+                    TungMessage::Text(text) => {
+                        if !*codec.get_or_insert(true) {
+                            continue; // locked to proto/binary
+                        }
+                        match decode_json_frame(&text) {
+                            Ok(f) => (json_frame_to_proto(f), true),
+                            Err(_) => continue,
+                        }
                     }
                     TungMessage::Close(_) => break,
-                    _ => {}
-                }
+                    _ => continue,
+                };
+                handle_frame(frame, json, &routes, &transcoder, &outbound_tx, &done_tx, &mut streams).await;
             }
         }
     }
@@ -79,10 +103,22 @@ pub async fn serve(routes: Routes, websocket: HyperWebsocket, _config: ServerCon
     let _ = writer.await;
 }
 
+/// Build the WebSocket message for a frame in the stream's codec.
+fn to_tung(frame: &Frame, json: bool) -> TungMessage {
+    if json {
+        if let Some(jf) = proto_frame_to_json(frame) {
+            return TungMessage::Text(encode_json_frame(&jf).into());
+        }
+    }
+    TungMessage::Binary(encode_frame(frame))
+}
+
 async fn handle_frame(
     frame: Frame,
+    json: bool,
     routes: &Routes,
-    outbound_tx: &mpsc::Sender<Frame>,
+    transcoder: &Option<Arc<Transcoder>>,
+    outbound_tx: &mpsc::Sender<TungMessage>,
     done_tx: &mpsc::Sender<u32>,
     streams: &mut HashMap<u32, StreamState>,
 ) {
@@ -90,13 +126,17 @@ async fn handle_frame(
         Some(Kind::Subscribe(sub)) => {
             let stream_id = sub.stream_id;
             if streams.contains_key(&stream_id) {
-                send_reset(outbound_tx, stream_id, Code::InvalidArgument, "stream_id in use").await;
+                send_reset(outbound_tx, stream_id, json, Code::InvalidArgument, "stream_id in use").await;
+                return;
+            }
+            if json && transcoder.is_none() {
+                send_reset(outbound_tx, stream_id, json, Code::Unimplemented, "+json needs a transcoder").await;
                 return;
             }
             let path: PathAndQuery = match sub.method.parse() {
                 Ok(p) => p,
                 Err(_) => {
-                    send_reset(outbound_tx, stream_id, Code::InvalidArgument, "invalid method").await;
+                    send_reset(outbound_tx, stream_id, json, Code::InvalidArgument, "invalid method").await;
                     return;
                 }
             };
@@ -118,6 +158,8 @@ async fn handle_frame(
                 stream_id,
                 outbound_tx.clone(),
                 done_tx.clone(),
+                json,
+                transcoder.clone(),
             ));
             streams.insert(stream_id, StreamState { req_tx: Some(req_tx), task });
         }
@@ -150,12 +192,31 @@ async fn run_stream(
     timeout: Option<std::time::Duration>,
     req_rx: mpsc::Receiver<Bytes>,
     stream_id: u32,
-    outbound_tx: mpsc::Sender<Frame>,
+    outbound_tx: mpsc::Sender<TungMessage>,
     done_tx: mpsc::Sender<u32>,
+    json: bool,
+    transcoder: Option<Arc<Transcoder>>,
 ) {
-    // Request body: a live stream of gRPC-framed messages.
-    let body_stream = ReceiverStream::new(req_rx)
-        .map(|payload| Ok::<_, Infallible>(BodyFrame::data(grpc_frame(&payload))));
+    let method_path = path.path().to_string();
+
+    // Request body: a live stream of gRPC-framed messages, transcoding each
+    // JSON request message to protobuf when `json`.
+    let req_tc = transcoder.clone();
+    let req_path = method_path.clone();
+    let body_stream = ReceiverStream::new(req_rx).map(move |payload| {
+        let proto = if json {
+            // A transcode failure yields empty bytes, which the router rejects.
+            req_tc
+                .as_ref()
+                .unwrap()
+                .request_json_to_proto(&req_path, &payload)
+                .map(Bytes::from)
+                .unwrap_or_default()
+        } else {
+            payload
+        };
+        Ok::<_, Infallible>(BodyFrame::data(grpc_frame(&proto)))
+    });
     let req_body = TonicBody::new(StreamBody::new(body_stream));
 
     let mut builder = Request::builder().method(http::Method::POST).uri(path);
@@ -179,7 +240,7 @@ async fn run_stream(
         stream_id,
         headers: metadata::metadata_to_vec(&tonic::metadata::MetadataMap::from_headers(parts.headers.clone())),
     };
-    let _ = outbound_tx.send(Frame { kind: Some(Kind::Header(header)) }).await;
+    let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Header(header)) }, json)).await;
 
     let mut deframer = Deframer::new();
     let mut trailers = HeaderMap::new();
@@ -193,10 +254,21 @@ async fn run_stream(
             let data = frame.into_data().unwrap_or_default();
             deframer.push(&data);
             while let Some(msg) = deframer.next_message() {
-                let out = Frame {
-                    kind: Some(Kind::Message(WsMessage { stream_id, payload: msg.to_vec() })),
+                // Transcode each protobuf response message to JSON when `json`.
+                let payload = if json {
+                    match transcoder.as_ref().unwrap().response_proto_to_json(&method_path, &msg) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            send_reset(&outbound_tx, stream_id, json, Code::Internal, &format!("json encode: {e}")).await;
+                            let _ = done_tx.send(stream_id).await;
+                            return;
+                        }
+                    }
+                } else {
+                    msg.to_vec()
                 };
-                if outbound_tx.send(out).await.is_err() {
+                let out = Frame { kind: Some(Kind::Message(WsMessage { stream_id, payload })) };
+                if outbound_tx.send(to_tung(&out, json)).await.is_err() {
                     let _ = done_tx.send(stream_id).await;
                     return;
                 }
@@ -215,11 +287,17 @@ async fn run_stream(
         status_message,
         trailers: metadata::metadata_to_vec(&tonic::metadata::MetadataMap::from_headers(trailers)),
     };
-    let _ = outbound_tx.send(Frame { kind: Some(Kind::Trailer(trailer)) }).await;
+    let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Trailer(trailer)) }, json)).await;
     let _ = done_tx.send(stream_id).await;
 }
 
-async fn send_reset(outbound_tx: &mpsc::Sender<Frame>, stream_id: u32, code: Code, message: &str) {
+async fn send_reset(
+    outbound_tx: &mpsc::Sender<TungMessage>,
+    stream_id: u32,
+    json: bool,
+    code: Code,
+    message: &str,
+) {
     let frame = Frame {
         kind: Some(Kind::Reset(Reset {
             stream_id,
@@ -227,5 +305,5 @@ async fn send_reset(outbound_tx: &mpsc::Sender<Frame>, stream_id: u32, code: Cod
             status_message: message.to_string(),
         })),
     };
-    let _ = outbound_tx.send(frame).await;
+    let _ = outbound_tx.send(to_tung(&frame, json)).await;
 }

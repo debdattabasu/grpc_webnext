@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ProxyConfig {
         upstream,
-        max_message_bytes: 4 * 1024 * 1024,
+        ..Default::default()
     };
 
     tracing::info!(%listen, upstream = %config.upstream, "grpc-webnext-proxy listening");

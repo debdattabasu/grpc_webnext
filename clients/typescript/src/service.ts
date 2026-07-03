@@ -12,6 +12,27 @@ import { Metadata } from "./metadata.js";
 export interface Serializer<T> {
   encode(message: T): { finish(): Uint8Array };
   decode(input: Uint8Array): T;
+  toJSON?(message: T): unknown;
+  fromJSON?(object: unknown): T;
+}
+
+/** Build byte-level (de)serializers for a method from the chosen codec. */
+export function methodCodec(
+  m: MethodInfo,
+  codec: "proto" | "json" | undefined,
+): { serialize: (req: any) => Uint8Array; deserialize: (bytes: Uint8Array) => any } {
+  if (codec === "json") {
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    return {
+      serialize: (req) => enc.encode(JSON.stringify(m.requestType.toJSON!(req))),
+      deserialize: (bytes) => m.responseType.fromJSON!(JSON.parse(dec.decode(bytes))),
+    };
+  }
+  return {
+    serialize: (req) => m.requestType.encode(req).finish(),
+    deserialize: (bytes) => m.responseType.decode(bytes),
+  };
 }
 
 /** One method of a service definition (ts-proto `generic-definitions` shape). */
@@ -91,8 +112,7 @@ export function makeClient<Def extends ServiceDefinition>(
   for (const key of Object.keys(definition.methods)) {
     const m = definition.methods[key];
     const path = `/${definition.fullName}/${m.name}`;
-    const serialize = (req: unknown) => m.requestType.encode(req).finish();
-    const deserialize = (bytes: Uint8Array) => m.responseType.decode(bytes);
+    const { serialize, deserialize } = methodCodec(m, options.codec);
     result[key] = makeMethod(client, m, path, serialize, deserialize);
   }
 

@@ -44,6 +44,7 @@ message Subscribe {
   repeated Metadatum headers = 3;    // request metadata
   uint32 timeout_millis = 4;         // gRPC deadline; 0 = none
   bytes  initial_payload = 5;        // optional first message (unary-style)
+  bool   json = 6;                   // payloads are JSON (+json codec) not binary
 }
 
 // Initial response metadata, sent once before the first Message (if any).

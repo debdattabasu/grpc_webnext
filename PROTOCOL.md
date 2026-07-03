@@ -10,29 +10,55 @@ request path; the WebSocket upgrade selects the streaming path.
 | `application/grpc` | native gRPC (untouched, same port) |
 | `application/grpc-webnext+proto` | grpc-webnext, binary protobuf |
 | `application/grpc-webnext+json` | grpc-webnext, JSON |
+| `application/json` | alias for `+json` on the Fetch path (response echoes it) |
+
+The codec is **native** on both transports: proto uses binary framing; JSON is
+idiomatic JSON on the wire (never wrapped in the binary framing).
 
 ## Unary — Fetch
 
 - **Request:** HTTP POST. Metadata → HTTP request headers. Body is the single
-  encoded message. `grpc-timeout` header carries the deadline.
-- **Response:** the browser cannot read HTTP trailers, so the server writes the
-  body as:
+  encoded message (binary protobuf, or JSON text for `+json`). `grpc-timeout`
+  header carries the deadline.
+- **Response (`+proto`):** the browser cannot read HTTP trailers, so the server
+  writes the body as two length-prefixed blocks:
 
   ```
   [ 4-byte big-endian length | message bytes ]
-  [ 4-byte big-endian length | trailer block ]
+  [ 4-byte big-endian length | Trailer block ]
   ```
 
-  The trailer block is an encoded `Trailer` (status + trailing metadata). Response
-  headers still carry the initial metadata. The client buffers the whole body up to
-  a **configurable size limit** and then splits message / trailer.
+  The trailer block is an encoded `Trailer` (status + trailing metadata). The
+  client buffers the whole body up to a **configurable size limit**.
+- **Response (`+json`):** the body is the **bare JSON message**; gRPC status and
+  metadata travel in HTTP response headers (`grpc-status`, `grpc-message`, plus
+  metadata). No length-prefix, no trailer block — a plain JSON API you can `curl`.
 - Server-streaming does **not** use Fetch — it goes over WebSocket (Fetch would have
   to buffer the entire stream). Fetch is unary only.
 
 ## Streaming — WebSocket
 
-One protobuf `Frame` per WebSocket message (see `proto/grpc_webnext.proto`).
-**One message per frame, no fragmentation.**
+The WebSocket **message type disambiguates the codec** — no handshake header
+needed (browsers can't set one). The connection is **locked to its first frame's
+type**: text ⇒ JSON for the whole connection, binary ⇒ protobuf; frames of the
+other type are dropped thereafter.
+
+- **binary** WS messages → one protobuf `Frame` each (`proto/grpc_webnext.proto`);
+- **text** WS messages → one native-JSON frame each: a **flat object keyed by
+  `streamId`** where the present field is the kind (the application message is a
+  *real JSON value*, not base64):
+
+  ```jsonc
+  { "streamId": 1, "method": "/pkg.Svc/M", "metadata": {…} } // open (has method)
+  { "streamId": 1, "message": {…} }                          // data message
+  { "streamId": 1, "halfClose": true }                       // client done sending
+  { "streamId": 1, "metadata": {…} }                         // initial response metadata
+  { "streamId": 1, "status": { "code": 0, "message": "" } }  // terminal (trailer/reset)
+  ```
+
+  See `crates/core/src/json_frame.rs`.
+
+**One message per frame, no fragmentation** (both codecs).
 
 Lifecycle of a call:
 

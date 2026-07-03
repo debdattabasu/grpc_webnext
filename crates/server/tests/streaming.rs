@@ -30,6 +30,7 @@ async fn streaming_round_trip() {
         headers: vec![],
         timeout_millis: 0,
         initial_payload: EchoRequest { message: "a".into() }.encode_to_vec(),
+        json: false,
     })))
     .await
     .unwrap();

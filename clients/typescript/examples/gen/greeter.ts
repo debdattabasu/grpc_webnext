@@ -30,6 +30,10 @@ export interface ChatMessage {
   text: string;
 }
 
+export interface SleepRequest {
+  millis: number;
+}
+
 function createBaseHelloRequest(): HelloRequest {
   return { name: "" };
 }
@@ -320,6 +324,64 @@ export const ChatMessage: MessageFns<ChatMessage> = {
   },
 };
 
+function createBaseSleepRequest(): SleepRequest {
+  return { millis: 0 };
+}
+
+export const SleepRequest: MessageFns<SleepRequest> = {
+  encode(message: SleepRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.millis !== 0) {
+      writer.uint32(8).uint32(message.millis);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SleepRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSleepRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.millis = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SleepRequest {
+    return { millis: isSet(object.millis) ? globalThis.Number(object.millis) : 0 };
+  },
+
+  toJSON(message: SleepRequest): unknown {
+    const obj: any = {};
+    if (message.millis !== 0) {
+      obj.millis = Math.round(message.millis);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SleepRequest>): SleepRequest {
+    return SleepRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SleepRequest>): SleepRequest {
+    const message = createBaseSleepRequest();
+    message.millis = object.millis ?? 0;
+    return message;
+  },
+};
+
 /** A small service exercising every RPC cardinality. */
 export type GreeterDefinition = typeof GreeterDefinition;
 export const GreeterDefinition = {
@@ -351,6 +413,24 @@ export const GreeterDefinition = {
       requestStream: true,
       responseType: ChatMessage as typeof ChatMessage,
       responseStream: true,
+      options: {},
+    },
+    /** Client streaming -> served over WebSocket. */
+    concat: {
+      name: "Concat",
+      requestType: ChatMessage as typeof ChatMessage,
+      requestStream: true,
+      responseType: HelloReply as typeof HelloReply,
+      responseStream: false,
+      options: {},
+    },
+    /** Deliberately slow unary, for exercising deadlines. */
+    sleep: {
+      name: "Sleep",
+      requestType: SleepRequest as typeof SleepRequest,
+      requestStream: false,
+      responseType: HelloReply as typeof HelloReply,
+      responseStream: false,
       options: {},
     },
   },

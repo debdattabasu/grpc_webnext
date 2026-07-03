@@ -10,6 +10,7 @@ import type {
 } from "./transport.js";
 
 export const CT_PROTO = "application/grpc-webnext+proto";
+export const CT_JSON = "application/grpc-webnext+json";
 
 export interface FetchTransportOptions {
   /** Base URL of the grpc-webnext endpoint, e.g. "https://host:443". */
@@ -18,6 +19,8 @@ export interface FetchTransportOptions {
   maxMessageBytes?: number;
   /** Injectable fetch (defaults to global fetch). */
   fetch?: typeof fetch;
+  /** Message codec: "proto" (default) or "json". */
+  codec?: "proto" | "json";
 }
 
 /**
@@ -28,11 +31,13 @@ export class FetchTransport implements Transport {
   private readonly baseUrl: string;
   private readonly maxMessageBytes: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly contentType: string;
 
   constructor(options: FetchTransportOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.maxMessageBytes = options.maxMessageBytes ?? 4 * 1024 * 1024;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
+    this.contentType = options.codec === "json" ? CT_JSON : CT_PROTO;
   }
 
   async unary(
@@ -41,7 +46,7 @@ export class FetchTransport implements Transport {
     options: TransportCallOptions,
   ): Promise<UnaryResponse> {
     const headers = options.metadata.toHeaders();
-    headers.set("content-type", CT_PROTO);
+    headers.set("content-type", this.contentType);
     if (options.timeoutMillis && options.timeoutMillis > 0) {
       headers.set("grpc-timeout", `${Math.ceil(options.timeoutMillis)}m`);
     }
@@ -67,8 +72,23 @@ export class FetchTransport implements Transport {
     }
 
     const bodyBytes = new Uint8Array(await response.arrayBuffer());
-    const { message, trailer } = decodeFetchResponseBody(bodyBytes, this.maxMessageBytes);
+    if (bodyBytes.byteLength > this.maxMessageBytes) {
+      throw new RangeError(`response body exceeds size limit (${this.maxMessageBytes} bytes)`);
+    }
 
+    if (this.contentType === CT_JSON) {
+      // Native JSON: bare message body; status + metadata in HTTP headers.
+      const code = Number(response.headers.get("grpc-status") ?? "0") as Status;
+      const details = decodeURIComponent(response.headers.get("grpc-message") ?? "");
+      return {
+        message: bodyBytes,
+        headers: Metadata.fromHeaders(response.headers),
+        status: { code, details, metadata: Metadata.fromHeaders(response.headers) },
+      };
+    }
+
+    // Binary proto: `[len|message][len|trailer]` framed body.
+    const { message, trailer } = decodeFetchResponseBody(bodyBytes, this.maxMessageBytes);
     return {
       message,
       headers: Metadata.fromHeaders(response.headers),

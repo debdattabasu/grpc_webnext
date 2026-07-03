@@ -27,3 +27,4 @@ grpc-webnext-core = { path = "../core" }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 tokio-tungstenite = "0.29"
 prost = "0.14"
+serde_json = "1.0.150"

@@ -10,6 +10,10 @@ service Greeter {
   rpc Countdown(CountdownRequest) returns (stream Tick);
   // Bidi streaming -> served over WebSocket.
   rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+  // Client streaming -> served over WebSocket.
+  rpc Concat(stream ChatMessage) returns (HelloReply);
+  // Deliberately slow unary, for exercising deadlines.
+  rpc Sleep(SleepRequest) returns (HelloReply);
 }
 
 message HelloRequest {
@@ -30,4 +34,8 @@ message Tick {
 
 message ChatMessage {
   string text = 1;
+}
+
+message SleepRequest {
+  uint32 millis = 1;
 }

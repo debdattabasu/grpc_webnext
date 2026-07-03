@@ -7,6 +7,18 @@ service Echo {
   rpc Unary(EchoRequest) returns (EchoResponse);
   // Bidi streaming: echoes each message back.
   rpc Stream(stream EchoRequest) returns (stream EchoResponse);
+  // Server streaming that emits one message then hangs forever; used to observe
+  // upstream cancellation when the client resets/disconnects.
+  rpc Hang(EchoRequest) returns (stream EchoResponse);
+  // Unary that sleeps `millis` before replying; used to exercise deadlines.
+  rpc Sleep(SleepRequest) returns (EchoResponse);
+  // Unary that fails with UNAVAILABLE a preset number of times, then succeeds;
+  // used to exercise retry.
+  rpc FlakyUnary(EchoRequest) returns (EchoResponse);
+}
+
+message SleepRequest {
+  uint32 millis = 1;
 }
 
 message EchoRequest {

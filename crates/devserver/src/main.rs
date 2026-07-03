@@ -13,6 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
         upstream: format!("http://{upstream_addr}").parse()?,
         max_message_bytes: 4 * 1024 * 1024,
+        ..Default::default()
     })
     .await?;
 

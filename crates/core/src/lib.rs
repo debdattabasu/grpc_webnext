@@ -10,9 +10,12 @@ pub mod codec;
 pub mod fetch;
 pub mod frame;
 pub mod grpc_framing;
+pub mod json_frame;
 pub mod metadata;
+pub mod transcode;
 
 pub use codec::BytesCodec;
 pub use fetch::{decode_response_body, encode_response_body, FetchError};
 pub use frame::{decode_frame, encode_frame, FrameError};
 pub use grpc_framing::{deframe_all, frame as grpc_frame, Deframer};
+pub use transcode::{Transcoder, TranscodeError};

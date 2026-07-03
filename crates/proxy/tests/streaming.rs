@@ -18,6 +18,7 @@ async fn streaming_round_trip() {
     let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
         upstream: format!("http://{upstream_addr}").parse().unwrap(),
         max_message_bytes: 4 * 1024 * 1024,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -33,6 +34,7 @@ async fn streaming_round_trip() {
         headers: vec![],
         timeout_millis: 0,
         initial_payload: EchoRequest { message: "a".into() }.encode_to_vec(),
+        json: false,
     })))
     .await
     .unwrap();

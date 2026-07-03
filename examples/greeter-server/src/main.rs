@@ -3,8 +3,10 @@
 
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
+use grpc_webnext_core::Transcoder;
 use grpc_webnext_server::{bind_and_serve, ServerConfig};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -12,8 +14,10 @@ pub mod pb {
     tonic::include_proto!("greeter.v1");
 }
 
+const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/greeter_descriptor.bin"));
+
 use pb::greeter_server::{Greeter, GreeterServer};
-use pb::{ChatMessage, CountdownRequest, HelloReply, HelloRequest, Tick};
+use pb::{ChatMessage, CountdownRequest, HelloReply, HelloRequest, SleepRequest, Tick};
 use tonic::service::Routes;
 
 #[derive(Default)]
@@ -25,6 +29,14 @@ impl Greeter for GreeterSvc {
         let name = req.into_inner().name;
         Ok(Response::new(HelloReply {
             message: format!("Hello, {name}!"),
+        }))
+    }
+
+    async fn sleep(&self, req: Request<SleepRequest>) -> Result<Response<HelloReply>, Status> {
+        let millis = req.into_inner().millis;
+        tokio::time::sleep(std::time::Duration::from_millis(u64::from(millis))).await;
+        Ok(Response::new(HelloReply {
+            message: "awake".into(),
         }))
     }
 
@@ -41,6 +53,20 @@ impl Greeter for GreeterSvc {
             }
         };
         Ok(Response::new(Box::pin(output)))
+    }
+
+    async fn concat(
+        &self,
+        req: Request<Streaming<ChatMessage>>,
+    ) -> Result<Response<HelloReply>, Status> {
+        let mut inbound = req.into_inner();
+        let mut parts = Vec::new();
+        while let Some(msg) = inbound.next().await {
+            parts.push(msg?.text);
+        }
+        Ok(Response::new(HelloReply {
+            message: parts.join(" "),
+        }))
     }
 
     type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatMessage, Status>> + Send>>;
@@ -65,7 +91,12 @@ impl Greeter for GreeterSvc {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let routes = Routes::new(GreeterServer::new(GreeterSvc::default()));
-    let (addr, handle) = bind_and_serve(routes, ServerConfig::default()).await?;
+    let transcoder = Arc::new(Transcoder::from_file_descriptor_set(FILE_DESCRIPTOR_SET)?);
+    let (addr, handle) = bind_and_serve(
+        routes,
+        ServerConfig { transcoder: Some(transcoder), ..Default::default() },
+    )
+    .await?;
 
     // Print readiness for the demo harness, then serve until killed.
     let mut stdout = std::io::stdout();

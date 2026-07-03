@@ -33,7 +33,7 @@ struct StreamState {
 }
 
 /// Serve one upgraded WebSocket connection.
-pub async fn serve(channel: Channel, websocket: HyperWebsocket) {
+pub async fn serve(channel: Channel, websocket: HyperWebsocket, max_streams: usize) {
     let ws = match websocket.await {
         Ok(ws) => ws,
         Err(e) => {
@@ -81,7 +81,7 @@ pub async fn serve(channel: Channel, websocket: HyperWebsocket) {
                             Ok(f) => f,
                             Err(e) => { tracing::debug!("bad frame: {e}"); continue; }
                         };
-                        handle_frame(frame, &channel, &outbound_tx, &done_tx, &mut streams).await;
+                        handle_frame(frame, &channel, &outbound_tx, &done_tx, &mut streams, max_streams).await;
                     }
                     TungMessage::Close(_) => break,
                     // Ping/Pong handled by tungstenite; ignore Text.
@@ -105,12 +105,17 @@ async fn handle_frame(
     outbound_tx: &mpsc::Sender<Frame>,
     done_tx: &mpsc::Sender<u32>,
     streams: &mut HashMap<u32, StreamState>,
+    max_streams: usize,
 ) {
     match frame.kind {
         Some(Kind::Subscribe(sub)) => {
             let stream_id = sub.stream_id;
             if streams.contains_key(&stream_id) {
                 send_reset(outbound_tx, stream_id, Code::InvalidArgument, "stream_id already in use").await;
+                return;
+            }
+            if streams.len() >= max_streams {
+                send_reset(outbound_tx, stream_id, Code::ResourceExhausted, "too many concurrent streams").await;
                 return;
             }
             let path: PathAndQuery = match sub.method.parse() {
@@ -181,63 +186,79 @@ async fn run_stream(
     let request_stream = ReceiverStream::new(req_rx);
     let mut request = tonic::Request::from_parts(metadata, Default::default(), request_stream);
     if let Some(d) = timeout {
-        request.set_timeout(d);
+        request.set_timeout(d + crate::DEADLINE_GRACE); // forwarded as a backstop
     }
 
-    let mut client = tonic::client::Grpc::new(channel);
-    if let Err(e) = client.ready().await {
-        send_reset(&outbound_tx, stream_id, Code::Unavailable, &format!("upstream unready: {e}")).await;
-        let _ = done_tx.send(stream_id).await;
-        return;
-    }
-
-    let response = client.streaming(request, path, BytesCodec).await;
-
-    let mut response = match response {
-        Ok(r) => r,
-        Err(status) => {
-            send_trailer(&outbound_tx, stream_id, &status).await;
-            let _ = done_tx.send(stream_id).await;
+    // Establish the upstream call and pump responses to WS frames. On deadline
+    // expiry this future is dropped, cancelling the upstream RPC.
+    let pump = async {
+        let mut client = tonic::client::Grpc::new(channel);
+        if let Err(e) = client.ready().await {
+            send_reset(&outbound_tx, stream_id, Code::Unavailable, &format!("upstream unready: {e}")).await;
             return;
         }
-    };
+        let mut response = match client.streaming(request, path, BytesCodec).await {
+            Ok(r) => r,
+            Err(status) => {
+                send_trailer(&outbound_tx, stream_id, &status).await;
+                return;
+            }
+        };
 
-    // Initial response metadata.
-    let header = Header {
-        stream_id,
-        headers: metadata::metadata_to_vec(response.metadata()),
-    };
-    let _ = outbound_tx.send(Frame { kind: Some(Kind::Header(header)) }).await;
+        let header = Header {
+            stream_id,
+            headers: metadata::metadata_to_vec(response.metadata()),
+        };
+        let _ = outbound_tx.send(Frame { kind: Some(Kind::Header(header)) }).await;
 
-    let stream = response.get_mut();
-    loop {
-        match stream.message().await {
-            Ok(Some(payload)) => {
-                let frame = Frame {
-                    kind: Some(Kind::Message(WsMessage { stream_id, payload: payload.to_vec() })),
-                };
-                if outbound_tx.send(frame).await.is_err() {
+        let stream = response.get_mut();
+        loop {
+            match stream.message().await {
+                Ok(Some(payload)) => {
+                    let frame = Frame {
+                        kind: Some(Kind::Message(WsMessage { stream_id, payload: payload.to_vec() })),
+                    };
+                    if outbound_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let trailers = stream.trailers().await.ok().flatten().unwrap_or_default();
+                    let frame = Frame {
+                        kind: Some(Kind::Trailer(Trailer {
+                            stream_id,
+                            status_code: 0,
+                            status_message: String::new(),
+                            trailers: metadata::metadata_to_vec(&trailers),
+                        })),
+                    };
+                    let _ = outbound_tx.send(frame).await;
+                    break;
+                }
+                Err(status) => {
+                    send_trailer(&outbound_tx, stream_id, &status).await;
                     break;
                 }
             }
-            Ok(None) => {
-                let trailers = stream.trailers().await.ok().flatten().unwrap_or_default();
+        }
+    };
+
+    // Local deadline enforcement.
+    match timeout {
+        Some(d) => {
+            if tokio::time::timeout(d, pump).await.is_err() {
                 let frame = Frame {
                     kind: Some(Kind::Trailer(Trailer {
                         stream_id,
-                        status_code: 0,
-                        status_message: String::new(),
-                        trailers: metadata::metadata_to_vec(&trailers),
+                        status_code: Code::DeadlineExceeded as u32,
+                        status_message: "proxy deadline exceeded".into(),
+                        trailers: vec![],
                     })),
                 };
                 let _ = outbound_tx.send(frame).await;
-                break;
-            }
-            Err(status) => {
-                send_trailer(&outbound_tx, stream_id, &status).await;
-                break;
             }
         }
+        None => pump.await,
     }
 
     let _ = done_tx.send(stream_id).await;

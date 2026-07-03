@@ -1,5 +1,5 @@
 export { Client } from "./client.js";
-export type { CallOptions, ClientOptions } from "./client.js";
+export type { CallOptions, ClientOptions, Codec } from "./client.js";
 export { makeClient } from "./service.js";
 export type {
   MethodInfo,
@@ -7,6 +7,8 @@ export type {
   ServiceClient,
   ServiceDefinition,
 } from "./service.js";
+export { makePromiseClient } from "./promise.js";
+export type { PromiseCallOptions, PromiseServiceClient } from "./promise.js";
 export {
   ClientDuplexStream,
   ClientReadableStream,
@@ -17,7 +19,8 @@ export type { RequestCallback } from "./call.js";
 export { Metadata } from "./metadata.js";
 export type { MetadataValue } from "./metadata.js";
 export { ServiceError, Status } from "./status.js";
-export { FetchTransport, CT_PROTO } from "./fetch-transport.js";
+export { FetchTransport, CT_PROTO, CT_JSON } from "./fetch-transport.js";
+export { methodCodec } from "./service.js";
 export { WebSocketTransport } from "./ws-transport.js";
 export type {
   StatusResult,

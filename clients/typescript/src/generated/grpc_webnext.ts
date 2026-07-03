@@ -60,6 +60,8 @@ export interface Subscribe {
   timeoutMillis: number;
   /** optional first message (unary-style) */
   initialPayload: Uint8Array;
+  /** payloads are JSON (+json codec) not binary */
+  json: boolean;
 }
 
 /** Initial response metadata, sent once before the first Message (if any). */
@@ -402,7 +404,7 @@ export const Metadatum: MessageFns<Metadatum> = {
 };
 
 function createBaseSubscribe(): Subscribe {
-  return { streamId: 0, method: "", headers: [], timeoutMillis: 0, initialPayload: new Uint8Array(0) };
+  return { streamId: 0, method: "", headers: [], timeoutMillis: 0, initialPayload: new Uint8Array(0), json: false };
 }
 
 export const Subscribe: MessageFns<Subscribe> = {
@@ -421,6 +423,9 @@ export const Subscribe: MessageFns<Subscribe> = {
     }
     if (message.initialPayload.length !== 0) {
       writer.uint32(42).bytes(message.initialPayload);
+    }
+    if (message.json !== false) {
+      writer.uint32(48).bool(message.json);
     }
     return writer;
   },
@@ -472,6 +477,14 @@ export const Subscribe: MessageFns<Subscribe> = {
           message.initialPayload = reader.bytes();
           continue;
         }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.json = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -500,6 +513,7 @@ export const Subscribe: MessageFns<Subscribe> = {
         : isSet(object.initial_payload)
         ? bytesFromBase64(object.initial_payload)
         : new Uint8Array(0),
+      json: isSet(object.json) ? globalThis.Boolean(object.json) : false,
     };
   },
 
@@ -520,6 +534,9 @@ export const Subscribe: MessageFns<Subscribe> = {
     if (message.initialPayload.length !== 0) {
       obj.initialPayload = base64FromBytes(message.initialPayload);
     }
+    if (message.json !== false) {
+      obj.json = message.json;
+    }
     return obj;
   },
 
@@ -533,6 +550,7 @@ export const Subscribe: MessageFns<Subscribe> = {
     message.headers = object.headers?.map((e) => Metadatum.fromPartial(e)) || [];
     message.timeoutMillis = object.timeoutMillis ?? 0;
     message.initialPayload = object.initialPayload ?? new Uint8Array(0);
+    message.json = object.json ?? false;
     return message;
   },
 };
