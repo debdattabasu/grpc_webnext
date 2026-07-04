@@ -1,4 +1,4 @@
-import { decodeFetchResponseBody } from "./frame.js";
+import { decodeFetchResponseBody, encodeFetchRequestBody } from "./frame.js";
 import { Metadata } from "./metadata.js";
 import { Status } from "./status.js";
 import type {
@@ -51,10 +51,15 @@ export class FetchTransport implements Transport {
       headers.set("grpc-timeout", `${Math.ceil(options.timeoutMillis)}m`);
     }
 
+    // `+proto` requests are length-prefixed (`[u32 len | message]`) so the server can
+    // stream the upload into a gRPC frame without buffering; JSON is sent bare (it
+    // buffers to transcode anyway).
+    const body = this.contentType === CT_PROTO ? encodeFetchRequestBody(request) : request;
+
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method: "POST",
       headers,
-      body: request as BodyInit,
+      body: body as BodyInit,
       signal: options.signal,
     });
 

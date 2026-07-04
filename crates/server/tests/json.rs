@@ -341,7 +341,7 @@ async fn ws_subprotocol_pins_codec_to_json() {
 
     // A binary frame first would normally lock to proto, but the subprotocol pinned
     // JSON up front, so it is dropped.
-    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".to_vec() }))).await.unwrap();
+    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".as_slice().into() }))).await.unwrap();
     // Text opens the stream and echoes.
     ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
     ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
@@ -374,7 +374,7 @@ async fn ws_locks_to_text_on_first_text_frame() {
     // First frame text -> locked to JSON; opens the single stream.
     ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
     // A later binary frame must be dropped (locked to text).
-    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".to_vec() }))).await.unwrap();
+    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".as_slice().into() }))).await.unwrap();
     ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
 
     let mut echoed = Vec::new();
@@ -408,7 +408,7 @@ async fn ws_locks_to_binary_on_first_binary_frame() {
         method: String::new(), // ignored in single-stream mode; taken from the URL
         headers: vec![],
         timeout_millis: 0,
-        initial_payload: EchoRequest { message: "a".into() }.encode_to_vec(),
+        initial_payload: EchoRequest { message: "a".into() }.encode_to_vec().into(),
         json: false,
     })))
     .await

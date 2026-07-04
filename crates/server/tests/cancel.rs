@@ -35,7 +35,7 @@ async fn reset_cancels_in_process_handler() {
         method: "/echo.v1.Echo/Hang".into(),
         headers: vec![],
         timeout_millis: 0,
-        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec(),
+        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec().into(),
         json: false,
     })))
     .await

@@ -31,10 +31,11 @@ All three deliverables work end-to-end, covered by integration tests
 | TypeScript client — browser + Node | [`@grpc-webnext/client`](clients/typescript) | ✅ Fetch + WebSocket, typed codegen |
 | Shared wire codec & translation | [`grpc-webnext-core`](crates/core) | ✅ |
 
-Binary protobuf and JSON are both wired. Deadlines (local + forwarded),
-cancellation propagation, and unary retry are done on the proxy; JSON transcoding
-is served by the native library. Remaining polish (streaming retry, backpressure,
-JSON-in-the-proxy) is tracked in [doc/BACKLOG.md](doc/BACKLOG.md).
+Binary protobuf and JSON are both wired. Deadlines (local + forwarded) and
+cancellation propagation are done on the proxy; JSON transcoding is served by the
+native library. Retry is intentionally **not** in the proxy — it's a client concern
+(a wire proxy that retries causes retry storms). Remaining polish (backpressure,
+streaming uploads, JSON-in-the-proxy) is tracked in [doc/BACKLOG.md](doc/BACKLOG.md).
 
 ## Quickstart
 

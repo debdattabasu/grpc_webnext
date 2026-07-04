@@ -18,11 +18,12 @@ connection/semantics details are still stubbed:
 - [ ] **Trailing vs initial metadata fidelity (unary).** Fetch unary currently emits
   response metadata as HTTP headers and only status in the trailer block; trailing
   metadata from a unary call is not separated out.
-- [x] ~~Retry & connection management (unary).~~ `RetryPolicy` (max-attempts,
-  exponential backoff + full jitter, retryable codes) applied to unary upstream
-  calls, bounded by the deadline. Covered by `proxy/tests/retry.rs`. **Remaining:**
-  streaming retry (needs commit-point + outbound-buffer semantics), per-method
-  service-config keying, and retry throttling (token bucket).
+- [x] ~~Retry (unary) — REMOVED (2026-07-04).~~ A `RetryPolicy` was briefly on the
+  proxy, then removed on principle: retry belongs in the **client** (gRPC service
+  config). A protocol-level wire proxy fans many clients into one upstream, so
+  proxy-side retry amplifies load exactly when the upstream is failing (retry storms)
+  and compounds with client retries. Removing it also unblocked response streaming
+  (retry forced buffering to replay the request / peek the status). Not planned.
 - [x] ~~Max-concurrent-streams cap per WS.~~ `max_concurrent_streams` rejects excess
   `Subscribe`s with RESOURCE_EXHAUSTED. Covered by `proxy/tests/cancel.rs`.
 - [x] ~~Deadline enforcement proxy-side.~~ The proxy now drops the call at the

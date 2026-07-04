@@ -15,7 +15,7 @@ use crate::pb::Trailer;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 
-const LEN_PREFIX: usize = 4;
+pub const LEN_PREFIX: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -33,6 +33,33 @@ pub fn encode_response_body(message: &[u8], trailer: &Trailer) -> Bytes {
     let mut buf = BytesMut::with_capacity(LEN_PREFIX + message.len() + LEN_PREFIX + trailer_len);
     buf.put_u32(message.len() as u32);
     buf.put_slice(message);
+    buf.put_u32(trailer_len as u32);
+    trailer.encode(&mut buf).expect("BytesMut has capacity");
+    buf.freeze()
+}
+
+/// The empty message block (`[u32 len = 0]`): a trailers-only response (an error
+/// with no message) still needs the leading message block before the trailer block.
+pub const EMPTY_MESSAGE_BLOCK: [u8; LEN_PREFIX] = [0; LEN_PREFIX];
+
+/// Encode a `+proto` **unary request** body: a single `[u32 len | message]` block,
+/// mirroring the response's message block. The client prepends the length it already
+/// knows (protobuf is serialized whole), so the server/proxy can turn it into a gRPC
+/// frame — `[1-byte flag]` + this — and stream it upstream without buffering to measure.
+pub fn encode_request_body(message: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(LEN_PREFIX + message.len());
+    buf.put_u32(message.len() as u32);
+    buf.put_slice(message);
+    buf.freeze()
+}
+
+/// Encode just the trailing `[u32 len | Trailer bytes]` block. Used by the streaming
+/// response path, which forwards the message block straight from the inner gRPC frame
+/// (its `[u32 len | message]` layout already matches ours once the 1-byte compression
+/// flag is dropped) and only needs to append this at the end.
+pub fn encode_trailer_block(trailer: &Trailer) -> Bytes {
+    let trailer_len = trailer.encoded_len();
+    let mut buf = BytesMut::with_capacity(LEN_PREFIX + trailer_len);
     buf.put_u32(trailer_len as u32);
     trailer.encode(&mut buf).expect("BytesMut has capacity");
     buf.freeze()

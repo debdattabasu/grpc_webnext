@@ -12,13 +12,16 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use grpc_webnext_core::pb::Trailer;
-use grpc_webnext_core::{deframe_all, encode_response_body, grpc_frame, metadata, TranscodeError, Transcoder};
+use grpc_webnext_core::{
+    deframe_all, encode_response_body, encode_trailer_block, grpc_frame, metadata, TranscodeError,
+    Transcoder, EMPTY_MESSAGE_BLOCK, LEN_PREFIX,
+};
 use std::sync::Arc;
 use http::uri::PathAndQuery;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tonic::body::Body as TonicBody;
@@ -134,7 +137,7 @@ pub fn ws_bearer_token(headers: &HeaderMap) -> Option<String> {
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        (k == key).then(|| percent_decode(v))
+        (k == key).then(|| metadata::percent_decode(v))
     })
 }
 
@@ -316,7 +319,7 @@ async fn handle(
                 ));
             }
         }
-        Ok(unary(routes, config, req, CT_PROTO.to_string()).await)
+        Ok(unary(routes, config, req).await)
     } else if content_type == CT_JSON || content_type == "application/json" || content_type.is_empty() {
         // All JSON forms route through the REST matcher first. `+json` is the SDK
         // JSON contract (always allowed on a main path); plain JSON is flag-gated.
@@ -432,7 +435,7 @@ async fn json_unary_call(
     let trailer_headers = collected.trailers().cloned().unwrap_or_default();
     let body_bytes = collected.to_bytes();
     let mut out_message = deframe_all(&body_bytes).into_iter().next().unwrap_or_default();
-    let (status_code, status_message) = read_status(&trailer_headers, &resp_parts.headers);
+    let (status_code, status_message) = metadata::read_status(&trailer_headers, &resp_parts.headers);
 
     if status_code == 0 && !out_message.is_empty() {
         match config.transcoder.as_ref().unwrap().response_proto_to_json(grpc_path.path(), &out_message) {
@@ -449,23 +452,70 @@ fn is_json_ct(ct: &str) -> bool {
     ct == CT_JSON || ct == "application/json"
 }
 
+/// Turn a length-prefixed `+proto` Fetch request body (`[u32 len | message]`) into a
+/// streaming gRPC request body: peek the length prefix to enforce the size limit, then
+/// emit the `[1-byte flag]` + the client's block verbatim. A large upload is piped
+/// straight to the upstream frame without being buffered to measure — the length comes
+/// from the client's prefix.
+async fn frame_upstream_request(
+    mut body: Incoming,
+    max: usize,
+) -> Result<TonicBody, Response<ResBody>> {
+    // Peek the 4-byte length prefix (it may span read chunks) — one chunk, not the
+    // whole message.
+    let mut lead = bytes::BytesMut::new();
+    while lead.len() < LEN_PREFIX {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    lead.extend_from_slice(&data);
+                }
+            }
+            Some(Err(e)) => return Err(text_response(StatusCode::BAD_REQUEST, format!("read body: {e}"))),
+            None => break,
+        }
+    }
+    if lead.len() < LEN_PREFIX {
+        return Err(text_response(StatusCode::BAD_REQUEST, "request body missing length prefix"));
+    }
+    let declared = u32::from_be_bytes([lead[0], lead[1], lead[2], lead[3]]) as usize;
+    if declared > max {
+        return Err(text_response(StatusCode::PAYLOAD_TOO_LARGE, "request message exceeds size limit"));
+    }
+    let lead = lead.freeze();
+    let stream = async_stream::try_stream! {
+        yield BodyFrame::data(Bytes::from_static(&[0u8])); // gRPC compression flag (uncompressed)
+        yield BodyFrame::data(lead);                        // [u32 len | leading message bytes]
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| -> BoxError { format!("read body: {e}").into() })?;
+            if let Ok(data) = frame.into_data() {
+                yield BodyFrame::data(data);
+            }
+        }
+    };
+    // Annotate the boxed body to pin the stream's error type to BoxError (otherwise the
+    // `?` above leaves it ambiguous — anything `From<BoxError>` would satisfy tonic).
+    let body: UnsyncBoxBody<Bytes, BoxError> = StreamBody::new(stream).boxed_unsync();
+    Ok(TonicBody::new(body))
+}
+
 /// Forward a request to the inner router unchanged (native gRPC same-port).
 async fn passthrough(routes: Routes, req: Request<Incoming>) -> Response<ResBody> {
     let resp = routes.oneshot(req).await.unwrap_or_else(|e| match e {});
     resp.map(|b| b.map_err(Into::into).boxed_unsync())
 }
 
-/// Translate a grpc-webnext unary request into a native gRPC call to the router
-/// and write the `[len|message][len|trailer]` Fetch response body. When `json`,
-/// the request/response messages are transcoded JSON<->protobuf.
-async fn unary(
-    routes: Routes,
-    config: ServerConfig,
-    req: Request<Incoming>,
-    resp_ct: String,
-) -> Response<ResBody> {
-    let json = is_json_ct(&resp_ct);
-    let ct = resp_ct.as_str();
+/// Translate a grpc-webnext `+proto` unary request into a native gRPC call to the
+/// router and **stream** the `[len|message][len|trailer]` Fetch response body back.
+///
+/// The inner gRPC response frame is `[1-byte compression flag][u32 len][message]`, so
+/// dropping the leading flag byte (compression is never negotiated, so it's `0`) yields
+/// our `[u32 len][message]` block verbatim. We forward that straight from the inner body
+/// to the socket — never buffering the (possibly large) message — then append the trailer
+/// block once the inner call's trailers arrive. JSON can't do this (it must transcode the
+/// whole message and put status in headers), so it still buffers — see `json_unary_call`.
+async fn unary(routes: Routes, config: ServerConfig, req: Request<Incoming>) -> Response<ResBody> {
+    let ct = CT_PROTO;
     let (parts, body) = req.into_parts();
     let path = match parts.uri.path_and_query().cloned() {
         Some(p) => p,
@@ -477,23 +527,14 @@ async fn unary(
         return resp;
     }
 
-    let mut message = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => return text_response(StatusCode::BAD_REQUEST, format!("read body: {e}")),
+    // Stream the length-prefixed request body into a gRPC frame (no buffering — the
+    // length comes from the client's prefix).
+    let grpc_body = match frame_upstream_request(body, config.max_message_bytes).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
     };
-    if message.len() > config.max_message_bytes {
-        return text_response(StatusCode::PAYLOAD_TOO_LARGE, "request message exceeds size limit");
-    }
 
-    // JSON request -> binary protobuf for the router.
-    if json {
-        match config.transcoder.as_ref().unwrap().request_json_to_proto(path.path(), &message) {
-            Ok(proto) => message = proto.into(),
-            Err(e) => return webnext_error(ct, Code::InvalidArgument, &format!("bad json request: {e}")),
-        }
-    }
-
-    // Build a native gRPC request into the router: reframe body, force content-type.
+    // Build a native gRPC request into the router: forward metadata, force content-type.
     let mut builder = Request::builder().method(http::Method::POST).uri(path.clone());
     for (name, value) in parts.headers.iter() {
         if !metadata::is_denied(name) {
@@ -506,59 +547,66 @@ async fn unary(
     if let Some(v) = parts.headers.get("grpc-timeout") {
         builder = builder.header("grpc-timeout", v.clone());
     }
-    let grpc_req = builder
-        .body(TonicBody::new(Full::new(grpc_frame(&message))))
-        .expect("valid request");
+    let grpc_req = builder.body(grpc_body).expect("valid request");
 
     let resp = routes.oneshot(grpc_req).await.unwrap_or_else(|e| match e {});
-    let (resp_parts, resp_body) = resp.into_parts();
+    let (resp_parts, mut resp_body) = resp.into_parts();
 
-    let collected = match resp_body.collect().await {
-        Ok(c) => c,
-        Err(e) => return text_response(StatusCode::BAD_GATEWAY, format!("upstream body: {e}")),
-    };
-    let trailer_headers = collected.trailers().cloned().unwrap_or_default();
-    let body_bytes = collected.to_bytes();
-    let mut out_message = deframe_all(&body_bytes).into_iter().next().unwrap_or_default();
-
-    let (status_code, status_message) = read_status(&trailer_headers, &resp_parts.headers);
-
-    // Binary protobuf response -> JSON (only for a successful message).
-    if json && status_code == 0 && !out_message.is_empty() {
-        match config.transcoder.as_ref().unwrap().response_proto_to_json(path.path(), &out_message) {
-            Ok(j) => out_message = j.into(),
-            Err(e) => return webnext_error(ct, Code::Internal, &format!("bad json response: {e}")),
-        }
-    }
-
-    if json {
-        // Native JSON: bare JSON message body, status + metadata in HTTP headers.
-        return json_fetch_response(
-            ct,
-            out_message,
-            status_code,
-            &status_message,
-            &resp_parts.headers,
-            &trailer_headers,
-        );
-    }
-
-    // Binary proto: `[len|message][len|trailer]` body, initial metadata in headers.
-    let trailer = Trailer {
-        stream_id: 0,
-        status_code,
-        status_message,
-        trailers: metadata::metadata_to_vec(&tonic::metadata::MetadataMap::from_headers(trailer_headers)),
-    };
-    let framed = encode_response_body(&out_message, &trailer);
+    // Initial metadata -> HTTP response headers, written before the streamed body.
     let mut response = Response::builder().status(StatusCode::OK).header(http::header::CONTENT_TYPE, ct);
     if let Some(headers) = response.headers_mut() {
         metadata::merge_metadata_into_headers(
-            &tonic::metadata::MetadataMap::from_headers(resp_parts.headers),
+            &tonic::metadata::MetadataMap::from_headers(resp_parts.headers.clone()),
             headers,
         );
     }
-    response.body(boxed_full(Full::new(framed))).expect("valid response")
+
+    // Stream the message block from the inner gRPC frame (minus its flag byte), then
+    // append the trailer block built from the inner call's trailing status/metadata.
+    let resp_headers = resp_parts.headers;
+    let stream = async_stream::try_stream! {
+        let mut skip = 1usize; // drop the gRPC compression-flag byte
+        let mut saw_message = false;
+        let mut trailer_headers = HeaderMap::new();
+        while let Some(frame) = resp_body.frame().await {
+            let frame = frame.map_err(|e| -> BoxError { format!("upstream body: {e}").into() })?;
+            match frame.into_data() {
+                Ok(mut data) => {
+                    while skip > 0 && !data.is_empty() {
+                        let n = skip.min(data.len());
+                        let _ = data.split_to(n);
+                        skip -= n;
+                    }
+                    if !data.is_empty() {
+                        saw_message = true;
+                        yield BodyFrame::data(data);
+                    }
+                }
+                Err(frame) => {
+                    if let Ok(t) = frame.into_trailers() {
+                        trailer_headers = t;
+                    }
+                }
+            }
+        }
+        // A trailers-only response (error, no message frame) still needs the leading
+        // empty message block so the two-block layout parses.
+        if !saw_message {
+            yield BodyFrame::data(Bytes::copy_from_slice(&EMPTY_MESSAGE_BLOCK));
+        }
+        let (status_code, status_message) = metadata::read_status(&trailer_headers, &resp_headers);
+        let trailer = Trailer {
+            stream_id: 0,
+            status_code,
+            status_message,
+            trailers: metadata::metadata_to_vec(&tonic::metadata::MetadataMap::from_headers(trailer_headers)),
+        };
+        yield BodyFrame::data(encode_trailer_block(&trailer));
+    };
+
+    response
+        .body(StreamBody::new(stream).boxed_unsync())
+        .expect("valid response")
 }
 
 /// Build a native-JSON Fetch response: the JSON message is the bare body; gRPC
@@ -576,7 +624,7 @@ fn json_fetch_response(
         .header(http::header::CONTENT_TYPE, content_type)
         .header("grpc-status", status_code.to_string());
     if !status_message.is_empty() {
-        if let Ok(v) = http::HeaderValue::from_str(&percent_encode(status_message)) {
+        if let Ok(v) = http::HeaderValue::from_str(&metadata::percent_encode(status_message)) {
             builder = builder.header("grpc-message", v);
         }
     }
@@ -590,21 +638,6 @@ fn json_fetch_response(
     builder.body(boxed_full(Full::new(body))).expect("valid response")
 }
 
-/// Minimal percent-encoding for a `grpc-message` header value.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b' ' | b'-' | b'_' | b'.' | b'/' | b':') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// A grpc-webnext error response: native-JSON (status in headers) for `+json`,
-/// otherwise a framed empty-message + status-trailer body.
 /// Enforce the per-stream auth hook on a grpc-webnext Fetch call, mirroring the
 /// WebSocket `Subscribe` check — a unary RPC is a one-shot stream, so the same
 /// `ServerConfig::stream_auth` guards it. Native `application/grpc` passthrough is
@@ -649,39 +682,6 @@ fn webnext_error(content_type: &str, code: Code, message: &str) -> Response<ResB
         .header(http::header::CONTENT_TYPE, content_type)
         .body(boxed_full(Full::new(framed)))
         .expect("valid response")
-}
-
-/// Read gRPC status code + message from trailers, falling back to headers.
-fn read_status(trailers: &HeaderMap, headers: &HeaderMap) -> (u32, String) {
-    let get = |name: &str| trailers.get(name).or_else(|| headers.get(name));
-    let code = get("grpc-status")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    let message = get("grpc-message")
-        .and_then(|v| v.to_str().ok())
-        .map(percent_decode)
-        .unwrap_or_default();
-    (code, message)
-}
-
-/// Minimal gRPC `grpc-message` percent-decoding (%XX).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn boxed_full(body: Full<Bytes>) -> ResBody {

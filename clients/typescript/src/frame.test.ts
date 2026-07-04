@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { Trailer } from "./generated/grpc_webnext.js";
-import { decodeFetchResponseBody, decodeFrame, encodeFrame } from "./frame.js";
+import {
+  decodeFetchResponseBody,
+  decodeFrame,
+  encodeFetchRequestBody,
+  encodeFrame,
+} from "./frame.js";
 import { Metadata } from "./metadata.js";
 
 describe("frame codec", () => {
@@ -49,5 +54,19 @@ describe("frame codec", () => {
 
   it("enforces the size limit", () => {
     expect(() => decodeFetchResponseBody(new Uint8Array(100), 10)).toThrow(/size limit/);
+  });
+
+  it("frames a request body as [u32 len | message]", () => {
+    const message = new Uint8Array([5, 6, 7, 8, 9]);
+    const framed = encodeFetchRequestBody(message);
+    expect(framed.length).toBe(4 + message.length);
+    const len = new DataView(framed.buffer).getUint32(0, false); // big-endian
+    expect(len).toBe(message.length);
+    expect(framed.subarray(4)).toEqual(message);
+  });
+
+  it("frames an empty request body as a bare length prefix", () => {
+    const framed = encodeFetchRequestBody(new Uint8Array(0));
+    expect(framed).toEqual(new Uint8Array([0, 0, 0, 0]));
   });
 });

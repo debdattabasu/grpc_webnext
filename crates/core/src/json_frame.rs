@@ -106,8 +106,8 @@ fn json_to_meta_vec(meta: &Option<JsonMeta>) -> Vec<Metadatum> {
         .collect()
 }
 
-fn to_bytes(v: &Value) -> Vec<u8> {
-    serde_json::to_vec(v).unwrap_or_default()
+fn to_bytes(v: &Value) -> bytes::Bytes {
+    serde_json::to_vec(v).unwrap_or_default().into()
 }
 
 /// Build a `Subscribe` from a single-stream open frame, taking the method from the

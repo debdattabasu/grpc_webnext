@@ -37,6 +37,12 @@ impl EchoSvc {
         let (tx, rx) = mpsc::unbounded_channel();
         (EchoSvc { cancel_tx: Some(tx), ..Default::default() }, rx)
     }
+
+    /// An EchoSvc whose `FlakyUnary` fails `fail_times` times before succeeding.
+    /// For in-process use (native server tests) — mirrors [`spawn_flaky`].
+    pub fn flaky(fail_times: u32) -> Self {
+        EchoSvc { flaky_remaining: Arc::new(AtomicU32::new(fail_times)), ..Default::default() }
+    }
 }
 
 /// Fires `cancel_tx` when dropped — dropped when the `Hang` stream is cancelled.

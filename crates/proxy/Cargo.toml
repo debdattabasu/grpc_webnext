@@ -7,8 +7,8 @@ repository.workspace = true
 description = "Binary-only grpc-webnext proxy that fronts any upstream gRPC server."
 
 [dependencies]
+async-stream = "0.3.6"
 bytes = "1.12.0"
-fastrand = "2.4.1"
 futures = "0.3.32"
 grpc-webnext-core.workspace = true
 http = "1.4.2"

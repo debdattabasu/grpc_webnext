@@ -35,7 +35,7 @@ fn subscribe(stream_id: u32) -> TungMessage {
         method: "/echo.v1.Echo/Hang".into(),
         headers: vec![],
         timeout_millis: 0,
-        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec(),
+        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec().into(),
         json: false,
     }))
 }
@@ -91,7 +91,7 @@ where
         method: "/echo.v1.Echo/Hang".into(),
         headers: vec![],
         timeout_millis: 0,
-        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec(),
+        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec().into(),
         json: false,
     })))
     .await

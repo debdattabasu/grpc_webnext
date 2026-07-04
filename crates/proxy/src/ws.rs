@@ -192,7 +192,7 @@ async fn handle_frame(
             // Request message channel -> upstream request stream.
             let (req_tx, req_rx) = mpsc::channel::<Bytes>(16);
             if !sub.initial_payload.is_empty() {
-                let _ = req_tx.send(Bytes::from(sub.initial_payload)).await;
+                let _ = req_tx.send(sub.initial_payload).await;
             }
 
             let metadata = metadata::metadata_vec_to_metadata(&sub.headers);
@@ -214,7 +214,7 @@ async fn handle_frame(
         Some(Kind::Message(msg)) => {
             if let Some(state) = streams.get(&msg.stream_id) {
                 if let Some(tx) = &state.req_tx {
-                    let _ = tx.send(Bytes::from(msg.payload)).await;
+                    let _ = tx.send(msg.payload).await;
                 }
             }
         }
@@ -278,8 +278,9 @@ async fn run_stream(
         loop {
             match stream.message().await {
                 Ok(Some(payload)) => {
+                    // `payload` is `Bytes` from the upstream codec — forwarded without copying.
                     let frame = Frame {
-                        kind: Some(Kind::Message(WsMessage { stream_id, payload: payload.to_vec() })),
+                        kind: Some(Kind::Message(WsMessage { stream_id, payload })),
                     };
                     if outbound_tx.send(frame).await.is_err() {
                         break;

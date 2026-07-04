@@ -16,17 +16,19 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use grpc_webnext_core::pb::Trailer;
-use grpc_webnext_core::{encode_response_body, BytesCodec};
-use http::{Request, Response, StatusCode};
+use grpc_webnext_core::{
+    encode_response_body, encode_trailer_block, EMPTY_MESSAGE_BLOCK, LEN_PREFIX,
+};
+use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tonic::body::Body as TonicBody;
 use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
-use tonic::Status;
+use tonic::Code;
 use tower::ServiceExt;
 
 pub mod metadata;
@@ -49,10 +51,8 @@ pub type ResBody = UnsyncBoxBody<Bytes, BoxError>;
 pub struct ProxyConfig {
     /// Upstream gRPC endpoint (e.g. `http://127.0.0.1:50051`).
     pub upstream: http::Uri,
-    /// Max bytes to buffer for a single request/response message.
+    /// Max bytes to buffer for a single request message (the response is streamed).
     pub max_message_bytes: usize,
-    /// Retry policy for unary calls to the upstream.
-    pub retry: RetryPolicy,
     /// Max concurrent logical streams per WebSocket connection.
     pub max_concurrent_streams: usize,
     /// Interval between WebSocket keepalive pings on an open streaming connection.
@@ -72,7 +72,6 @@ impl Default for ProxyConfig {
         Self {
             upstream: http::Uri::default(),
             max_message_bytes: 4 * 1024 * 1024,
-            retry: RetryPolicy::default(),
             max_concurrent_streams: 100,
             ws_keepalive: None,
             ws_keepalive_timeout: Duration::from_secs(20),
@@ -80,30 +79,11 @@ impl Default for ProxyConfig {
     }
 }
 
-/// gRPC-style retry policy applied to unary upstream calls. Retries are bounded
-/// by `max_attempts`, only fire for `retryable_codes`, use exponential backoff
-/// with full jitter, and never outlive the call deadline.
-#[derive(Clone)]
-pub struct RetryPolicy {
-    /// Total attempts including the first. `1` disables retry.
-    pub max_attempts: u32,
-    pub initial_backoff: Duration,
-    pub max_backoff: Duration,
-    pub backoff_multiplier: f64,
-    pub retryable_codes: Vec<tonic::Code>,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 1, // retry off by default (opt-in, like gRPC service config)
-            initial_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_secs(1),
-            backoff_multiplier: 2.0,
-            retryable_codes: vec![tonic::Code::Unavailable],
-        }
-    }
-}
+// Retry is intentionally NOT implemented in the proxy. This is a protocol-level
+// wire proxy, not an application gateway: retries belong in the client (gRPC service
+// config), which can back off per-client. A proxy fans many clients into one upstream,
+// so proxy-side retry amplifies load exactly when the upstream is failing (retry
+// storms) and compounds with client retries. See doc/BACKLOG.md.
 
 #[derive(Clone)]
 struct Proxy {
@@ -221,119 +201,190 @@ impl Proxy {
         }
     }
 
-    /// Unary over Fetch: forward the single request message and write the
-    /// `[len|message][len|trailer]` response body. The deadline is forwarded
-    /// downstream and enforced locally (the call is dropped on expiry).
+    /// Unary over Fetch: forward the single request message to the upstream and
+    /// **stream** the `[len|message][len|trailer]` response body back. The upstream's
+    /// gRPC response frame is `[1-byte flag][u32 len][message]`, so dropping the flag
+    /// byte yields our message block verbatim — the proxy pipes it straight through
+    /// (opaque, no decode) without buffering the possibly-large message, then appends
+    /// the trailer block. The deadline is forwarded downstream (with grace) and enforced
+    /// locally: if the upstream doesn't respond in time the call is dropped (cancelling
+    /// it upstream) and DEADLINE_EXCEEDED is returned. No retry — see the note above.
     async fn handle_unary(&self, req: Request<Incoming>) -> Response<ResBody> {
         let Some(path) = req.uri().path_and_query().cloned() else {
             return text_response(StatusCode::BAD_REQUEST, "missing method path");
         };
-
-        let metadata = metadata::request_headers_to_metadata(req.headers());
         let deadline = metadata::parse_grpc_timeout(req.headers());
+        let (parts, body) = req.into_parts();
 
-        let body = match req.into_body().collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => return text_response(StatusCode::BAD_REQUEST, format!("read body: {e}")),
+        // Stream the length-prefixed request body straight into the upstream gRPC frame —
+        // opaque, no buffering. The length comes from the client's prefix.
+        let grpc_body = match frame_upstream_request(body, self.config.max_message_bytes).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
         };
-        if body.len() > self.config.max_message_bytes {
-            return text_response(StatusCode::PAYLOAD_TOO_LARGE, "request message exceeds size limit");
-        }
 
-        // Local deadline enforcement wraps all retry attempts; on expiry the
-        // in-flight call future is dropped, cancelling the upstream RPC.
-        let forward_deadline = deadline.map(|d| d + DEADLINE_GRACE);
-        let call = self.unary_with_retry(&path, &metadata, &body, forward_deadline);
-        let response = match deadline {
-            Some(d) => match tokio::time::timeout(d, call).await {
+        // Build the upstream gRPC request: forward metadata (minus the hop-by-hop
+        // denylist), force content-type, and forward grpc-timeout with grace so the
+        // upstream's own enforcement is a backstop to our local timer.
+        let mut builder = Request::builder().method(http::Method::POST).uri(path.clone());
+        for (name, value) in parts.headers.iter() {
+            if !metadata::is_denied(name) {
+                builder = builder.header(name.clone(), value.clone());
+            }
+        }
+        builder = builder
+            .header(http::header::CONTENT_TYPE, CT_GRPC)
+            .header("te", "trailers");
+        if let Some(d) = deadline {
+            builder = builder.header("grpc-timeout", metadata::format_grpc_timeout(d + DEADLINE_GRACE));
+        }
+        let grpc_req = builder.body(grpc_body).expect("valid request");
+
+        // Establish the call, bounded by the local deadline. Timing out here drops the
+        // future, which cancels the upstream RPC.
+        let channel = self.channel.clone();
+        let established = match deadline {
+            Some(d) => match tokio::time::timeout(d, channel.oneshot(grpc_req)).await {
                 Ok(r) => r,
-                Err(_) => Err(Status::deadline_exceeded("proxy deadline exceeded")),
+                Err(_) => return fetch_status(Code::DeadlineExceeded, "proxy deadline exceeded"),
             },
-            None => call.await,
+            None => channel.oneshot(grpc_req).await,
+        };
+        let resp = match established {
+            Ok(resp) => resp,
+            Err(e) => return fetch_status(Code::Unavailable, &format!("upstream: {e}")),
+        };
+        let (resp_parts, mut resp_body) = resp.into_parts();
+
+        // Initial metadata -> response headers, written before the streamed body.
+        let mut out = Response::builder().status(StatusCode::OK).header(http::header::CONTENT_TYPE, CT_PROTO);
+        if let Some(headers) = out.headers_mut() {
+            metadata::merge_metadata_into_headers(&MetadataMap::from_headers(resp_parts.headers.clone()), headers);
+        }
+
+        let resp_headers = resp_parts.headers;
+        let deadline_at = deadline.map(|d| tokio::time::Instant::now() + d);
+        let stream = async_stream::try_stream! {
+            let mut skip = 1usize; // drop the gRPC compression-flag byte
+            let mut saw_message = false;
+            let mut trailer_headers = HeaderMap::new();
+            let mut timed_out = false;
+            loop {
+                let next = match deadline_at {
+                    Some(at) => match tokio::time::timeout_at(at, resp_body.frame()).await {
+                        Ok(f) => f,
+                        Err(_) => { timed_out = true; break; }
+                    },
+                    None => resp_body.frame().await,
+                };
+                let Some(frame) = next else { break };
+                let frame = frame.map_err(|e| -> BoxError { format!("upstream body: {e}").into() })?;
+                match frame.into_data() {
+                    Ok(mut data) => {
+                        while skip > 0 && !data.is_empty() {
+                            let n = skip.min(data.len());
+                            let _ = data.split_to(n);
+                            skip -= n;
+                        }
+                        if !data.is_empty() {
+                            saw_message = true;
+                            yield BodyFrame::data(data);
+                        }
+                    }
+                    Err(frame) => {
+                        if let Ok(t) = frame.into_trailers() {
+                            trailer_headers = t;
+                        }
+                    }
+                }
+            }
+            // A deadline firing mid-message can't be signalled cleanly (the message block
+            // already promised a length we won't fulfil) — stop, letting the client see a
+            // truncated body. Before any message we can still emit a clean status.
+            if timed_out && saw_message {
+                return;
+            }
+            if !saw_message {
+                yield BodyFrame::data(Bytes::copy_from_slice(&EMPTY_MESSAGE_BLOCK));
+            }
+            let (status_code, status_message) = if timed_out {
+                (Code::DeadlineExceeded as u32, "proxy deadline exceeded".to_string())
+            } else {
+                metadata::read_status(&trailer_headers, &resp_headers)
+            };
+            let trailer = Trailer {
+                stream_id: 0,
+                status_code,
+                status_message,
+                trailers: metadata::metadata_to_vec(&MetadataMap::from_headers(trailer_headers)),
+            };
+            yield BodyFrame::data(encode_trailer_block(&trailer));
         };
 
-        let (message, trailer, response_metadata) = match response {
-            Ok(resp) => {
-                let meta = resp.metadata().clone();
-                let msg = resp.into_inner();
-                let trailer = Trailer {
-                    stream_id: 0,
-                    status_code: 0,
-                    status_message: String::new(),
-                    trailers: Vec::new(),
-                };
-                (msg, trailer, meta)
-            }
-            Err(status) => {
-                let trailer = Trailer {
-                    stream_id: 0,
-                    status_code: status.code() as u32,
-                    status_message: status.message().to_string(),
-                    trailers: metadata::metadata_to_vec(status.metadata()),
-                };
-                (Bytes::new(), trailer, MetadataMap::new())
-            }
-        };
-
-        let framed = encode_response_body(&message, &trailer);
-        let mut builder = Response::builder()
-            .status(StatusCode::OK)
-            .header(http::header::CONTENT_TYPE, CT_PROTO);
-        if let Some(headers) = builder.headers_mut() {
-            metadata::merge_metadata_into_headers(&response_metadata, headers);
-        }
-        builder.body(boxed_full(Full::new(framed))).expect("valid response")
+        out.body(StreamBody::new(stream).boxed_unsync()).expect("valid response")
     }
+}
 
-    /// Forward a unary call to the upstream, retrying per the configured policy.
-    /// Each attempt rebuilds the request; retries stop at `max_attempts`, on a
-    /// non-retryable code, or on success. The caller's deadline bounds the whole
-    /// loop (including backoff sleeps).
-    async fn unary_with_retry(
-        &self,
-        path: &http::uri::PathAndQuery,
-        metadata: &MetadataMap,
-        body: &Bytes,
-        forward_deadline: Option<std::time::Duration>,
-    ) -> Result<tonic::Response<Bytes>, Status> {
-        let policy = &self.config.retry;
-        let mut backoff = policy.initial_backoff;
-        let mut attempt = 0;
-
-        loop {
-            attempt += 1;
-
-            let mut request =
-                tonic::Request::from_parts(metadata.clone(), Default::default(), body.clone());
-            if let Some(d) = forward_deadline {
-                request.set_timeout(d);
+/// Turn a length-prefixed `+proto` Fetch request body (`[u32 len | message]`) into a
+/// streaming gRPC request body: peek the length prefix to enforce the size limit, then
+/// emit the `[1-byte flag]` + the client's block verbatim. A large upload is piped
+/// straight upstream without being buffered to measure — the length comes from the
+/// client's prefix.
+async fn frame_upstream_request(
+    mut body: Incoming,
+    max: usize,
+) -> Result<TonicBody, Response<ResBody>> {
+    // Peek the 4-byte length prefix (it may span read chunks) — one chunk, not the
+    // whole message.
+    let mut lead = bytes::BytesMut::new();
+    while lead.len() < LEN_PREFIX {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    lead.extend_from_slice(&data);
+                }
             }
-
-            let mut client = tonic::client::Grpc::new(self.channel.clone());
-            let result = match client.ready().await {
-                Ok(()) => client.unary::<Bytes, Bytes, _>(request, path.clone(), BytesCodec).await,
-                Err(e) => Err(Status::unavailable(format!("upstream unready: {e}"))),
-            };
-
-            let status = match result {
-                Ok(resp) => return Ok(resp),
-                Err(status) => status,
-            };
-
-            let can_retry =
-                attempt < policy.max_attempts && policy.retryable_codes.contains(&status.code());
-            if !can_retry {
-                return Err(status);
-            }
-
-            // Exponential backoff with full jitter: sleep in [0, backoff).
-            let jittered = backoff.mul_f64(fastrand::f64());
-            tokio::time::sleep(jittered).await;
-            backoff = backoff
-                .mul_f64(policy.backoff_multiplier)
-                .min(policy.max_backoff);
+            Some(Err(e)) => return Err(text_response(StatusCode::BAD_REQUEST, format!("read body: {e}"))),
+            None => break,
         }
     }
+    if lead.len() < LEN_PREFIX {
+        return Err(text_response(StatusCode::BAD_REQUEST, "request body missing length prefix"));
+    }
+    let declared = u32::from_be_bytes([lead[0], lead[1], lead[2], lead[3]]) as usize;
+    if declared > max {
+        return Err(text_response(StatusCode::PAYLOAD_TOO_LARGE, "request message exceeds size limit"));
+    }
+    let lead = lead.freeze();
+    let stream = async_stream::try_stream! {
+        yield BodyFrame::data(Bytes::from_static(&[0u8])); // gRPC compression flag (uncompressed)
+        yield BodyFrame::data(lead);                        // [u32 len | leading message bytes]
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| -> BoxError { format!("read body: {e}").into() })?;
+            if let Ok(data) = frame.into_data() {
+                yield BodyFrame::data(data);
+            }
+        }
+    };
+    // Annotate the boxed body to pin the stream's error type to BoxError.
+    let body: UnsyncBoxBody<Bytes, BoxError> = StreamBody::new(stream).boxed_unsync();
+    Ok(TonicBody::new(body))
+}
+
+/// A buffered Fetch response carrying only a status (empty message block + trailer),
+/// for failures that happen before any response body is available.
+fn fetch_status(code: Code, message: &str) -> Response<ResBody> {
+    let trailer = Trailer {
+        stream_id: 0,
+        status_code: code as u32,
+        status_message: message.to_string(),
+        trailers: Vec::new(),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, CT_PROTO)
+        .body(boxed_full(Full::new(encode_response_body(&[], &trailer))))
+        .expect("valid response")
 }
 
 fn boxed_full(body: Full<Bytes>) -> ResBody {

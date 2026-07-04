@@ -89,7 +89,7 @@ pub fn metadata_to_vec(meta: &MetadataMap) -> Vec<Metadatum> {
         if key.ends_with("-bin") {
             out.push(Metadatum {
                 key,
-                value: Some(metadatum::Value::BinValue(value.as_bytes().to_vec())),
+                value: Some(metadatum::Value::BinValue(value.as_bytes().to_vec().into())),
             });
         } else if let Ok(s) = value.to_str() {
             out.push(Metadatum {
@@ -130,6 +130,54 @@ pub fn grpc_timeout_from_millis(timeout_millis: u32) -> Option<Duration> {
         0 => None,
         m => Some(Duration::from_millis(u64::from(m))),
     }
+}
+
+/// Read the gRPC status `(code, message)` from a response's trailers, falling back to
+/// its headers (a "trailers-only" response carries the status in the headers). The
+/// `grpc-message` value is percent-decoded.
+pub fn read_status(trailers: &HeaderMap, headers: &HeaderMap) -> (u32, String) {
+    let get = |name: &str| trailers.get(name).or_else(|| headers.get(name));
+    let code = get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let message = get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .map(percent_decode)
+        .unwrap_or_default();
+    (code, message)
+}
+
+/// Minimal percent-encoding for a `grpc-message` header value.
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b' ' | b'-' | b'_' | b'.' | b'/' | b':') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Minimal gRPC `grpc-message` percent-decoding (`%XX`).
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, Subscribe};
-use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame};
+use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame, encode_request_body};
 use grpc_webnext_server::{bind_and_serve, ws_bearer_token, ServerConfig, CT_PROTO};
 use prost::Message as _;
 use testecho::pb::echo_client::EchoClient;
@@ -49,7 +49,7 @@ fn subscribe(stream_id: u32, metadata: &[(&str, &str)]) -> TungMessage {
             method: "/echo.v1.Echo/Unary".into(),
             headers,
             timeout_millis: 0,
-            initial_payload: EchoRequest { message: "hi".into() }.encode_to_vec(),
+            initial_payload: EchoRequest { message: "hi".into() }.encode_to_vec().into(),
             json: false,
         })),
     }))
@@ -268,7 +268,7 @@ async fn fetch_unary(base: &str, authorization: Option<&str>) -> (Bytes, u32, St
     let mut req = reqwest::Client::new()
         .post(format!("{base}/echo.v1.Echo/Unary"))
         .header("content-type", CT_PROTO)
-        .body(EchoRequest { message: "hi".into() }.encode_to_vec());
+        .body(encode_request_body(&EchoRequest { message: "hi".into() }.encode_to_vec()).to_vec());
     if let Some(a) = authorization {
         req = req.header("authorization", a);
     }

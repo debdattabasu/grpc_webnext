@@ -34,7 +34,7 @@ async fn streaming_round_trip() {
         method: "/echo.v1.Echo/Stream".into(),
         headers: vec![],
         timeout_millis: 0,
-        initial_payload: EchoRequest { message: "a".into() }.encode_to_vec(),
+        initial_payload: EchoRequest { message: "a".into() }.encode_to_vec().into(),
         json: false,
     })))
     .await
@@ -43,7 +43,7 @@ async fn streaming_round_trip() {
     // Second request message, then half-close.
     ws.send(frame(Kind::Message(WsMessage {
         stream_id: 1,
-        payload: EchoRequest { message: "b".into() }.encode_to_vec(),
+        payload: EchoRequest { message: "b".into() }.encode_to_vec().into(),
     })))
     .await
     .unwrap();

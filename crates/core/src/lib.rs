@@ -16,7 +16,10 @@ pub mod metadata;
 pub mod transcode;
 
 pub use codec::BytesCodec;
-pub use fetch::{decode_response_body, encode_response_body, FetchError};
+pub use fetch::{
+    decode_response_body, encode_request_body, encode_response_body, encode_trailer_block, FetchError,
+    EMPTY_MESSAGE_BLOCK, LEN_PREFIX,
+};
 pub use frame::{decode_frame, encode_frame, FrameError};
 pub use grpc_framing::{deframe_all, frame as grpc_frame, Deframer};
 pub use httprule::{HttpCall, HttpRouter, WsBinding};

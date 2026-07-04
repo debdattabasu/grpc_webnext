@@ -122,13 +122,60 @@ JSON-ish content types route through the same transcode-first path
 on a REST URL (`crates/server/tests/json.rs:192`). Only `+proto` is rejected on
 annotated URLs. The REST-section sentence is stale.
 
+## Improvements
+
+- **Streaming `+proto` Fetch responses (native server), 2026-07-04.** The binary
+  Fetch response is now streamed rather than buffered: `unary` in
+  `crates/server/src/lib.rs` no longer `collect()`s the inner gRPC response. Since
+  the status lives in the trailer block *after* the message (not in a header), the
+  server never needs the whole message up front — it drops the inner gRPC frame's
+  1-byte compression flag (turning `[flag][u32 len][msg]` into our `[u32 len][msg]`
+  block), pipes that straight through a `StreamBody`, and appends the trailer block
+  once the inner call's trailers arrive. A large binary blob is no longer malloc'd
+  on the server. Wire format is byte-identical (all existing decode tests pass).
+  New coverage in `crates/server/tests/unary.rs`: `large_response_streams_intact`
+  (3 MiB multi-chunk), `empty_ok_message_streams`, `error_response_is_trailers_only`
+  (trailers-only → synthesized empty message block). JSON still buffers (it must
+  transcode and put status in a header).
+- **Streaming `+proto` Fetch responses (proxy) + retry removed, 2026-07-04.** The
+  same streaming now applies to the proxy's `handle_unary`: it forwards the upstream
+  gRPC frame opaquely (minus the flag byte) via a `StreamBody` and appends the trailer,
+  instead of `client.unary()` materializing the whole message. This required
+  **removing the proxy's retry policy** — retry belongs in the client (a wire proxy
+  fanning many clients into one upstream turns a blip into a retry storm, and compounds
+  with client retries), and it was also what forced buffering (replay the request /
+  peek the status). Deadline handling is preserved: the establish is bounded by the
+  local deadline (→ clean `DEADLINE_EXCEEDED`, cancels upstream), and the body stream
+  is bounded too. Shared `read_status`/`percent_*` helpers moved to core metadata.
+  New coverage in `crates/proxy/tests/unary.rs`: `large_response_streams_intact`,
+  `upstream_error_is_trailers_only`; existing `deadline.rs`/`cancel.rs` still pass.
+- **Streaming `+proto` Fetch *requests* (uploads), 2026-07-04.** The Fetch `+proto`
+  request wire format is now **length-prefixed** — `[u32 len | message]`, mirroring the
+  response's message block. The client (`encodeFetchRequestBody` in
+  `clients/typescript/src/frame.ts`) prepends the length it already knows, so the server
+  and proxy (`frame_upstream_request`) peek only the 4-byte prefix for the size-limit
+  check, then stream `[flag] + body` into the upstream gRPC frame — a large upload is no
+  longer buffered to measure. JSON requests stay bare (they transcode). Genuinely
+  unknown-length streamed uploads are a WebSocket concern, not Fetch. New coverage:
+  `frame.test.ts` (client framing) plus every `+proto` Fetch test now round-trips the
+  prefixed body; `large_response_streams_intact` sends 3 MiB through.
+
+- **WS payload copy-elimination (prost `Bytes`), 2026-07-05.** The WS path materializes
+  each message whole (inherent — one message per WS frame, no fragmentation; fragmenting
+  a single large message stays deferred). It was also copying each payload ~3× per side.
+  Switched prost to decode `bytes` fields as `Bytes` (`crates/core/build.rs` `.bytes(["."])`)
+  so `Message.payload`/`initial_payload` are sliced, not copied: dropped the
+  `payload.to_vec()` in both `run_stream`s and the redundant `Bytes::from(...)` wrappers,
+  leaving only the one unavoidable envelope-serialize per outbound message. Rust-only —
+  no wire or TS change (all suites still pass).
+
 ## Undocumented wire-observable behavior
 
 - **Request-size limit → 413** (`max_message_bytes`, native server and proxy).
   The doc only mentions the client's response-buffer limit.
-- **Proxy unary retry policy** — backoff with jitter, retryable-code gating,
-  deadline-bounded, off by default (`crates/proxy/src/lib.rs:71-94`); well
-  tested (`crates/proxy/tests/retry.rs`) but absent from the doc.
+- ~~Proxy unary retry policy~~ — **removed 2026-07-04.** Retry belongs in the
+  client, not a wire proxy (retry storms; see the Improvements section and
+  `doc/BACKLOG.md`). Removing it also unblocked proxy response streaming.
 - **Stream-level error cases**: duplicate `stream_id` in a Subscribe →
   `Reset{INVALID_ARGUMENT, "stream_id in use"}`; `+json` without a transcoder →
   `Reset{UNIMPLEMENTED}` on WS but HTTP `501` on Fetch; exceeding the proxy's

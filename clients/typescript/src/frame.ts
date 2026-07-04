@@ -11,6 +11,20 @@ export function decodeFrame(bytes: Uint8Array): Frame {
 }
 
 /**
+ * Frame a `+proto` unary request body as a single `[u32 len | message]` block
+ * (big-endian length), mirroring the response's message block. The client already
+ * has the whole serialized message, so it prepends the length it knows — letting the
+ * server/proxy stream the upload straight to the upstream gRPC frame without buffering
+ * it to measure. (JSON requests are sent as the bare body — they buffer to transcode.)
+ */
+export function encodeFetchRequestBody(message: Uint8Array): Uint8Array {
+  const out = new Uint8Array(4 + message.byteLength);
+  new DataView(out.buffer).setUint32(0, message.byteLength, false); // big-endian
+  out.set(message, 4);
+  return out;
+}
+
+/**
  * Parse a buffered Fetch unary response body:
  *
  * ```

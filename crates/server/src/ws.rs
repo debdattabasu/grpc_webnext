@@ -310,7 +310,7 @@ async fn handle_frame(
 
             let (req_tx, req_rx) = mpsc::channel::<Bytes>(16);
             if !sub.initial_payload.is_empty() {
-                let _ = req_tx.send(Bytes::from(sub.initial_payload)).await;
+                let _ = req_tx.send(sub.initial_payload).await;
             }
 
             // An annotation route with no body (GET-style server-stream) takes its
@@ -346,7 +346,7 @@ async fn handle_frame(
         Some(Kind::Message(msg)) => {
             if let Some(state) = streams.get(&msg.stream_id) {
                 if let Some(tx) = &state.req_tx {
-                    let _ = tx.send(Bytes::from(msg.payload)).await;
+                    let _ = tx.send(msg.payload).await;
                 }
             }
         }
@@ -443,7 +443,7 @@ async fn run_stream(
                 // Transcode each protobuf response message to JSON when `json`.
                 let payload = if json {
                     match transcoder.as_ref().unwrap().response_proto_to_json(&method_path, &msg) {
-                        Ok(j) => j,
+                        Ok(j) => j.into(),
                         Err(e) => {
                             send_reset(&outbound_tx, stream_id, json, multi, Code::Internal, &format!("json encode: {e}")).await;
                             let _ = done_tx.send(stream_id).await;
@@ -451,7 +451,7 @@ async fn run_stream(
                         }
                     }
                 } else {
-                    msg.to_vec()
+                    msg // Bytes: forwarded without copying
                 };
                 let out = Frame { kind: Some(Kind::Message(WsMessage { stream_id, payload })) };
                 if outbound_tx.send(to_tung(&out, json, multi)).await.is_err() {
@@ -466,7 +466,7 @@ async fn run_stream(
         }
     }
 
-    let (status_code, status_message) = crate::read_status(&trailers, &parts.headers);
+    let (status_code, status_message) = metadata::read_status(&trailers, &parts.headers);
     let trailer = Trailer {
         stream_id,
         status_code,

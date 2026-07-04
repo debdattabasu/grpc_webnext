@@ -37,9 +37,13 @@ idiomatic JSON on the wire (never wrapped in the binary framing).
 
 ## Unary — Fetch
 
-- **Request:** HTTP POST. Metadata → HTTP request headers. Body is the single
-  encoded message (binary protobuf, or JSON text for `+json`). `grpc-timeout`
-  header carries the deadline.
+- **Request:** HTTP POST. Metadata → HTTP request headers; `grpc-timeout` carries the
+  deadline. For **`+proto`** the body is the single message **length-prefixed** —
+  `[ 4-byte big-endian length | message bytes ]`, mirroring the response's message block.
+  The client already has the whole serialized message, so it prepends the length it
+  knows; the server/proxy then turn it into a gRPC frame (prepend the `[1-byte flag]`)
+  and **stream** it upstream without buffering to measure. For **`+json`** the body is
+  the bare JSON text (buffered, since it's transcoded).
 - **Response (`+proto`):** the browser cannot read HTTP trailers, so the server
   writes the body as two length-prefixed blocks:
 
@@ -49,12 +53,26 @@ idiomatic JSON on the wire (never wrapped in the binary framing).
   ```
 
   The trailer block is an encoded `Trailer` (status + trailing metadata). The
-  client buffers the whole body up to a **configurable size limit**.
+  client buffers the whole body up to a **configurable size limit**. On the **server
+  and the proxy** this response is **streamed, not buffered**: because the status rides
+  in the trailer block *after* the message (not in a header), neither needs the whole
+  message up front. The inner gRPC frame is already `[1-byte flag][4-byte length |
+  message]`, so dropping the compression-flag byte yields our first block verbatim — the
+  message is piped straight to the socket and the trailer block appended at the end. A
+  large binary blob therefore isn't malloc'd. (The proxy does this opaquely — it never
+  decodes the message — which is also why it does no retry: a wire proxy can't replay a
+  streamed call, and retry belongs in the client anyway.)
 - **Response (`+json`):** the body is the **bare JSON message**; gRPC status and
   metadata travel in HTTP response headers (`grpc-status`, `grpc-message`, plus
   metadata). No length-prefix, no trailer block — a plain JSON API you can `curl`.
+  Unlike `+proto`, JSON **is** buffered on the server: it transcodes the whole protobuf
+  message to JSON and the status goes in a header (which must precede the body), so the
+  full message is needed before anything is written.
 - Server-streaming does **not** use Fetch — it goes over WebSocket (Fetch would have
-  to buffer the entire stream). Fetch is unary only.
+  to buffer the entire stream). Fetch is unary only. A genuinely *streamed* upload of
+  unknown length also goes over WebSocket — the Fetch upload path assumes a known-length
+  message (always true for protobuf), which is what lets the client supply the length
+  prefix.
 
 ### REST transcoding (`google.api.http`)
 

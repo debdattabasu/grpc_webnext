@@ -442,8 +442,8 @@ dependencies = [
 name = "grpc-webnext-proxy"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "bytes",
- "fastrand",
  "futures",
  "grpc-webnext-core",
  "http",
@@ -467,6 +467,7 @@ dependencies = [
 name = "grpc-webnext-server"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "bytes",
  "futures",
  "grpc-webnext-core",

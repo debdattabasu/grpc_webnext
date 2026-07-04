@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Subscribe};
-use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame};
+use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame, encode_request_body};
 use grpc_webnext_proxy::{bind_and_serve, ProxyConfig, CT_PROTO};
 use prost::Message;
 use testecho::pb::{EchoRequest, SleepRequest};
@@ -35,7 +35,7 @@ async fn unary_deadline_returns_deadline_exceeded() {
     let base = proxy_over(upstream).await;
 
     // Upstream sleeps 5s; the client deadline is 200ms -> proxy must give up.
-    let body = SleepRequest { millis: 5000 }.encode_to_vec();
+    let body = encode_request_body(&SleepRequest { millis: 5000 }.encode_to_vec()).to_vec();
     let resp = reqwest::Client::new()
         .post(format!("{base}/echo.v1.Echo/Sleep"))
         .header("content-type", CT_PROTO)
@@ -65,7 +65,7 @@ async fn streaming_deadline_trailer_and_upstream_cancel() {
         method: "/echo.v1.Echo/Hang".into(),
         headers: vec![],
         timeout_millis: 200,
-        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec(),
+        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec().into(),
         json: false,
     })))
     .await
