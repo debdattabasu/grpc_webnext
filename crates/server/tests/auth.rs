@@ -4,13 +4,15 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, Subscribe};
-use grpc_webnext_core::{decode_frame, encode_frame};
-use grpc_webnext_server::{bind_and_serve, ws_bearer_token, ServerConfig};
+use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame};
+use grpc_webnext_server::{bind_and_serve, ws_bearer_token, ServerConfig, CT_PROTO};
 use prost::Message as _;
+use testecho::pb::echo_client::EchoClient;
 use testecho::pb::echo_server::EchoServer;
-use testecho::pb::EchoRequest;
+use testecho::pb::{EchoRequest, EchoResponse};
 use testecho::EchoSvc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
@@ -244,6 +246,66 @@ async fn stream_auth_rejects_with_reset() {
     ws.send(half_close(2)).await.unwrap();
     let (code, _) = read_until_status(&mut ws).await.expect("expected a status");
     assert_eq!(code, 0);
+}
+
+// ---- Fetch-path per-stream auth: the same `stream_auth` hook guards unary Fetch ----
+
+/// A `stream_auth` gate admitting only `authorization: Bearer good`.
+fn stream_auth_good_gate() -> ServerConfig {
+    ServerConfig {
+        stream_auth: Some(Arc::new(|_m: &str, md: &tonic::metadata::MetadataMap| {
+            match md.get("authorization").and_then(|v| v.to_str().ok()) {
+                Some("Bearer good") => Ok(()),
+                _ => Err(Status::unauthenticated("stream denied")),
+            }
+        })),
+        ..Default::default()
+    }
+}
+
+/// POST a grpc-webnext `+proto` unary request; decode the framed `(message, trailer)`.
+async fn fetch_unary(base: &str, authorization: Option<&str>) -> (Bytes, u32, String) {
+    let mut req = reqwest::Client::new()
+        .post(format!("{base}/echo.v1.Echo/Unary"))
+        .header("content-type", CT_PROTO)
+        .body(EchoRequest { message: "hi".into() }.encode_to_vec());
+    if let Some(a) = authorization {
+        req = req.header("authorization", a);
+    }
+    let resp = req.send().await.unwrap();
+    // grpc-webnext always carries the gRPC status in the trailer block, so the HTTP
+    // status is 200 even on an auth failure.
+    assert_eq!(resp.status(), 200);
+    let raw = Bytes::from(resp.bytes().await.unwrap().to_vec());
+    let (message, trailer) = decode_response_body(raw, 4 * 1024 * 1024).unwrap();
+    (message, trailer.status_code, trailer.status_message)
+}
+
+#[tokio::test]
+async fn fetch_stream_auth_rejects_bad_token() {
+    let base = start(stream_auth_good_gate()).await.replace("ws://", "http://");
+    let (_msg, code, message) = fetch_unary(&base, None).await;
+    assert_eq!(code, Code::Unauthenticated as u32);
+    assert_eq!(message, "stream denied");
+}
+
+#[tokio::test]
+async fn fetch_stream_auth_admits_good_token() {
+    let base = start(stream_auth_good_gate()).await.replace("ws://", "http://");
+    let (msg, code, message) = fetch_unary(&base, Some("Bearer good")).await;
+    assert_eq!(code, 0, "status: {message}");
+    assert_eq!(EchoResponse::decode(msg).unwrap().message, "hi");
+}
+
+#[tokio::test]
+async fn fetch_native_passthrough_is_exempt_from_stream_auth() {
+    // stream_auth guards the grpc-webnext surface, not native application/grpc — that's
+    // the raw gRPC surface, guarded by the router's own interceptors. A real tonic
+    // client must still get through even with a deny-all stream_auth configured.
+    let base = start(stream_auth_good_gate()).await.replace("ws://", "http://");
+    let mut client = EchoClient::connect(base).await.unwrap();
+    let resp = client.unary(EchoRequest { message: "native".into() }).await.unwrap();
+    assert_eq!(resp.into_inner().message, "native");
 }
 
 #[test]

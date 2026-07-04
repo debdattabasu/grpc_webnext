@@ -184,10 +184,18 @@ ping/pong frame (the `Frame` oneof reserves the old field numbers 6/7).
 ### Auth
 
 Auth is **per stream** (like gRPC call credentials / grpc-web — the browser has no
-connection-level credential it can drive). The `authorization` metadata rides in each
-stream's open/`Subscribe` frame and is the authoritative check (`ServerConfig::stream_auth`
-→ `Reset{ UNAUTHENTICATED }` on failure). Fetch is the same: `authorization` is an HTTP
-request header, and the response carries `grpc-status` (`16`).
+connection-level credential it can drive). `ServerConfig::stream_auth` is the
+authoritative check, run on **every grpc-webnext stream on both transports** — each
+WebSocket `Subscribe` and each unary Fetch call (a unary RPC is a one-shot stream). It
+receives the method and the request metadata (`authorization` rides in the `Subscribe`
+frame on WebSocket, or the HTTP request headers on Fetch) and returns a `Status`. That
+status is not hardcoded to `UNAUTHENTICATED`: the hook may return any code (e.g.
+`PERMISSION_DENIED` for a valid-but-unauthorized token). On WebSocket a failure becomes
+a `Reset` carrying that status; on Fetch it becomes the response's `grpc-status` (so a
+denied `+proto` call still returns HTTP 200 with the status in the trailer block, and a
+`+json` call carries it in the `grpc-status` header). Native `application/grpc`
+passthrough is **exempt** — that's the raw gRPC surface, guarded by the router's own
+interceptors, not a grpc-webnext-translated stream.
 
 On WebSocket there's an **optional handshake gate** so a bad credential can be rejected
 *before any frame is read*. A browser can set only one handshake header —
@@ -213,9 +221,11 @@ gRPC connection-auth layer (gRPC's connection auth is mTLS, which browser JS can
 
 ### stream_id
 
-Only present in **multiplexed** (`+multi`) mode, where it disambiguates streams on a
-shared socket. Single-stream mode omits it entirely (the socket *is* the stream);
-internally the server fixes it to `1`.
+Meaningful only in **multiplexed** (`+multi`) mode, where it disambiguates streams on a
+shared socket. In single-stream mode the socket *is* the stream, so `stream_id` carries
+no information: the **JSON** codec omits it from the wire entirely, while the **binary**
+codec still carries it fixed at `1` (protobuf has no field omission — see the binary
+single-stream note above). Either way the server ignores the wire value and uses `1`.
 
 ### Multiplexing
 

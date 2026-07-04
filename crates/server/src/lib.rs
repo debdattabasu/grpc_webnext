@@ -404,6 +404,11 @@ async fn json_unary_call(
     req_headers: &HeaderMap,
     resp_ct: &str,
 ) -> Response<ResBody> {
+    // Per-stream auth, same hook as the WebSocket Subscribe path.
+    if let Some(resp) = fetch_stream_auth(config, grpc_path.path(), req_headers, resp_ct) {
+        return resp;
+    }
+
     let mut builder = Request::builder().method(http::Method::POST).uri(grpc_path.clone());
     for (name, value) in req_headers.iter() {
         if !metadata::is_denied(name) {
@@ -466,6 +471,11 @@ async fn unary(
         Some(p) => p,
         None => return text_response(StatusCode::BAD_REQUEST, "missing method path"),
     };
+
+    // Per-stream auth, same hook as the WebSocket Subscribe path.
+    if let Some(resp) = fetch_stream_auth(&config, path.path(), &parts.headers, ct) {
+        return resp;
+    }
 
     let mut message = match body.collect().await {
         Ok(c) => c.to_bytes(),
@@ -595,6 +605,27 @@ fn percent_encode(s: &str) -> String {
 
 /// A grpc-webnext error response: native-JSON (status in headers) for `+json`,
 /// otherwise a framed empty-message + status-trailer body.
+/// Enforce the per-stream auth hook on a grpc-webnext Fetch call, mirroring the
+/// WebSocket `Subscribe` check — a unary RPC is a one-shot stream, so the same
+/// `ServerConfig::stream_auth` guards it. Native `application/grpc` passthrough is
+/// exempt: that's the raw gRPC surface, guarded by the router's own interceptors.
+/// Returns `Some(error response)` (status carried per the codec: `+json` in headers,
+/// `+proto` in a trailer block) when the hook rejects, or `None` to proceed — matching
+/// a gRPC client's view of the rejection.
+fn fetch_stream_auth(
+    config: &ServerConfig,
+    method: &str,
+    headers: &HeaderMap,
+    resp_ct: &str,
+) -> Option<Response<ResBody>> {
+    let auth = config.stream_auth.as_ref()?;
+    let md = metadata::request_headers_to_metadata(headers);
+    match auth(method, &md) {
+        Ok(()) => None,
+        Err(status) => Some(webnext_error(resp_ct, status.code(), status.message())),
+    }
+}
+
 fn webnext_error(content_type: &str, code: Code, message: &str) -> Response<ResBody> {
     if is_json_ct(content_type) {
         return json_fetch_response(

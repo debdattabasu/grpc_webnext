@@ -90,25 +90,27 @@ ping with a pong. Changes:
   within the window; a peer that keeps answering stays connected. PROTOCOL.md's
   keepalive paragraph documents both the ping mechanism and the timeout.
 
-### Smaller inaccuracies
+### Smaller inaccuracies — RESOLVED (2026-07-04)
 
-- **stream_id "omitted entirely"** (PROTOCOL.md stream_id section): true only
-  for JSON, where the serializer skips it outside multi mode
-  (`json_frame.rs:160`). Binary frames always carry `stream_id: 1` in
-  single-stream mode — the doc says so itself in the binary single-stream
-  paragraph, so the stream_id section contradicts it. Accurate statement: JSON
-  omits it; binary carries it fixed at 1; either way it's meaningless in
-  single-stream mode.
-- **"Fetch is the same" for auth**: `ServerConfig::stream_auth`'s only call
-  site is the WebSocket Subscribe handler (`crates/server/src/ws.rs:247`). On
-  Fetch, `authorization` flows through to the inner tonic service; a
-  `grpc-status: 16` only appears if the service/interceptor rejects. A team
-  registering `stream_auth` thinking it guards everything has an
-  unauthenticated Fetch surface. Either document "enforce Fetch auth in your
-  service/interceptor" or run the hook on the Fetch path too.
-- **`Reset{ UNAUTHENTICATED }` isn't hardcoded**: the Reset carries whatever
-  `Status` the `stream_auth` hook returns (`ws.rs:245-252`) — more flexible
-  than documented (e.g. PERMISSION_DENIED for valid-but-unauthorized).
+- **stream_id "omitted entirely"** (doc fix): the stream_id section contradicted
+  the binary single-stream note (which says `stream_id` is fixed to `1`). Reworded
+  to: JSON omits it from the wire, binary carries it fixed at `1` (protobuf has no
+  field omission), and the server ignores the wire value in single-stream mode
+  either way.
+- **"Fetch is the same" for auth** (code fix — this one was a real gap, not just
+  wording): `stream_auth` used to run only on the WebSocket `Subscribe` path, so a
+  server that registered it had an **unauthenticated Fetch surface**. Now
+  `fetch_stream_auth` runs the same hook on the grpc-webnext Fetch surface —
+  `unary` (`+proto`) and `json_unary_call` (`+json` and REST-transcoded) in
+  `crates/server/src/lib.rs` — rejecting with the hook's status carried per the
+  codec. Native `application/grpc` passthrough is deliberately exempt (raw gRPC
+  surface, guarded by the router's interceptors). Covered by
+  `crates/server/tests/auth.rs`: `fetch_stream_auth_rejects_bad_token`,
+  `fetch_stream_auth_admits_good_token`, and
+  `fetch_native_passthrough_is_exempt_from_stream_auth`.
+- **`Reset{ UNAUTHENTICATED }` isn't hardcoded** (doc fix): clarified that the
+  Reset (WS) / `grpc-status` (Fetch) carries whatever `Status` the hook returns —
+  any code, e.g. `PERMISSION_DENIED` for a valid-but-unauthorized token.
 
 ## Internal doc contradiction
 
@@ -166,7 +168,8 @@ annotated URLs. The REST-section sentence is stale.
   limit is tested, TS client's isn't), the `FetchTransport.startStream` throw,
   `poolSize > 1` round-robin distribution, `grpc-timeout` header emission on
   Fetch unary (deadline tests all go through streaming).
-- **Fetch-path auth**: no test in `auth.rs`.
+- **Fetch-path auth**: covered as of the smaller-inaccuracies fix — `auth.rs` now
+  exercises `stream_auth` on Fetch (reject, admit, passthrough-exempt).
 - **Close-event handling**: covered as of drift 2's fix
   (`test/ws-close-status.test.ts`). Remaining gap: no full cross-language e2e of
   a *native-server* handshake reject reaching the client, because the e2e
