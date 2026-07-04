@@ -11,6 +11,9 @@ use prost_reflect::prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde::Serialize;
 
+use crate::httprule::HttpRouter;
+pub use crate::httprule::{HttpCall, WsBinding};
+
 #[derive(Debug, thiserror::Error)]
 pub enum TranscodeError {
     #[error("failed to load descriptor set: {0}")]
@@ -21,13 +24,17 @@ pub enum TranscodeError {
     Json(#[from] serde_json::Error),
     #[error("protobuf decode error: {0}")]
     Decode(String),
+    #[error("http transcoding: {0}")]
+    Http(String),
 }
 
 /// Transcodes application messages between JSON and binary protobuf, keyed by
-/// gRPC method path (`/pkg.Service/Method`).
+/// gRPC method path (`/pkg.Service/Method`), and maps `google.api.http` REST
+/// bindings onto gRPC methods.
 #[derive(Clone)]
 pub struct Transcoder {
     pool: DescriptorPool,
+    router: HttpRouter,
 }
 
 impl Transcoder {
@@ -35,7 +42,37 @@ impl Transcoder {
     pub fn from_file_descriptor_set(bytes: &[u8]) -> Result<Self, TranscodeError> {
         let pool = DescriptorPool::decode(bytes)
             .map_err(|e| TranscodeError::Descriptor(e.to_string()))?;
-        Ok(Self { pool })
+        let router = HttpRouter::from_pool(&pool);
+        Ok(Self { pool, router })
+    }
+
+    /// Whether any `google.api.http` REST bindings were found.
+    pub fn has_http_rules(&self) -> bool {
+        !self.router.is_empty()
+    }
+
+    /// Map a REST request `(method, path, query, body)` onto a gRPC call, or
+    /// `Ok(None)` if no HTTP binding matches.
+    pub fn transcode_http_request(
+        &self,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        body: &[u8],
+    ) -> Result<Option<HttpCall>, TranscodeError> {
+        self.router.transcode(method, path, query, body)
+    }
+
+    /// Resolve a WebSocket annotation route from its upgrade path, or `None` if the
+    /// path matches no binding.
+    pub fn match_ws(&self, path: &str, query: Option<&str>) -> Option<WsBinding> {
+        self.router.match_ws(path, query)
+    }
+
+    /// Whether a gRPC method has any HTTP annotation (used to keep an annotated
+    /// RPC's main route off the plain-HTTP surface).
+    pub fn is_annotated_method(&self, grpc_method: &str) -> bool {
+        self.router.is_annotated(grpc_method)
     }
 
     /// Resolve `(request_type, response_type)` for a method path.

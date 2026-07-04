@@ -23,7 +23,8 @@ async fn streaming_round_trip() {
     .await
     .unwrap();
 
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{proxy_addr}/"))
+    // Single-stream: the method is the WS URL path.
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{proxy_addr}/echo.v1.Echo/Stream"))
         .await
         .unwrap();
 

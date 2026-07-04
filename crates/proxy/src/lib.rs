@@ -129,11 +129,40 @@ impl Proxy {
     async fn handle(&self, mut req: Request<Incoming>) -> Result<Response<ResBody>, Infallible> {
         // WebSocket streaming path: hijack the connection and serve frames.
         if hyper_tungstenite::is_upgrade_request(&req) {
+            // Parse the offered subprotocols. The proxy is proto-only; it just needs
+            // multiplexing (many streams per socket) vs single-stream (the method is
+            // the WS URL). The credential/codec details are the native server's job.
+            let subs: Vec<String> = req
+                .headers()
+                .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+                .unwrap_or_default();
+            let has = |s: &str| subs.iter().any(|p| p == s);
+            let multi = has("grpc-webnext+proto+multi") || has("grpc-webnext+json+multi");
+            // Echo whichever recognized subprotocol was offered.
+            let echo = [
+                "grpc-webnext+proto+multi",
+                "grpc-webnext+json+multi",
+                "grpc-webnext+proto",
+                "grpc-webnext+json",
+                "grpc-webnext",
+            ]
+            .into_iter()
+            .find(|&p| has(p));
+            // Single-stream: the method is the URL path; multiplexed: from each Subscribe.
+            let method = (!multi).then(|| req.uri().path().to_string());
             return Ok(match hyper_tungstenite::upgrade(&mut req, None) {
-                Ok((response, websocket)) => {
+                Ok((mut response, websocket)) => {
+                    if let Some(p) = echo {
+                        response.headers_mut().insert(
+                            http::header::SEC_WEBSOCKET_PROTOCOL,
+                            http::HeaderValue::from_static(p),
+                        );
+                    }
                     let channel = self.channel.clone();
                     let max_streams = self.config.max_concurrent_streams;
-                    tokio::spawn(async move { ws::serve(channel, websocket, max_streams).await });
+                    tokio::spawn(async move { ws::serve(channel, websocket, max_streams, multi, method).await });
                     response.map(boxed_full)
                 }
                 Err(e) => text_response(StatusCode::BAD_REQUEST, format!("upgrade failed: {e}")),

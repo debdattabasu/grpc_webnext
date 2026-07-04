@@ -56,7 +56,8 @@ async fn streaming_deadline_trailer_and_upstream_cancel() {
     // Observe that the deadline also cancels the upstream call.
     let (upstream, mut cancel_rx) = testecho::spawn_with_cancel().await;
     let base = proxy_over(upstream).await;
-    let url = base.replacen("http", "ws", 1);
+    // Single-stream: the method is the WS URL path.
+    let url = format!("{}/echo.v1.Echo/Hang", base.replacen("http", "ws", 1));
 
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     ws.send(frame(Kind::Subscribe(Subscribe {

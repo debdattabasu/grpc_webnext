@@ -19,7 +19,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/echo_descriptor.bin"));
 
 use pb::echo_server::{Echo, EchoServer};
-use pb::{EchoRequest, EchoResponse, SleepRequest};
+use pb::{EchoRequest, EchoResponse, RepeatRequest, SleepRequest};
 
 #[derive(Default)]
 pub struct EchoSvc {
@@ -117,6 +117,41 @@ impl Echo for EchoSvc {
             let _guard = guard;
             yield Ok(EchoResponse { message: "started".into() });
             futures::future::pending::<()>().await;
+        };
+        Ok(Response::new(Box::pin(output)))
+    }
+
+    type ChatStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<EchoResponse, Status>> + Send>>;
+
+    async fn chat(
+        &self,
+        request: Request<Streaming<EchoRequest>>,
+    ) -> Result<Response<Self::ChatStream>, Status> {
+        let mut inbound = request.into_inner();
+        let output = async_stream::stream! {
+            while let Some(req) = inbound.next().await {
+                match req {
+                    Ok(EchoRequest { message }) => yield Ok(EchoResponse { message }),
+                    Err(e) => { yield Err(e); break; }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(output)))
+    }
+
+    type RepeatStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<EchoResponse, Status>> + Send>>;
+
+    async fn repeat(
+        &self,
+        request: Request<RepeatRequest>,
+    ) -> Result<Response<Self::RepeatStream>, Status> {
+        let RepeatRequest { message, count } = request.into_inner();
+        let output = async_stream::stream! {
+            for _ in 0..count {
+                yield Ok(EchoResponse { message: message.clone() });
+            }
         };
         Ok(Response::new(Box::pin(output)))
     }

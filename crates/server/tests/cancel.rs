@@ -22,9 +22,11 @@ fn frame(kind: Kind) -> TungMessage {
 async fn reset_cancels_in_process_handler() {
     let (svc, mut cancel_rx) = EchoSvc::with_cancel();
     let routes = Routes::new(EchoServer::new(svc));
-    let (addr, _handle) = bind_and_serve(routes, ServerConfig::default()).await.unwrap();
+    // Single-stream mode takes the method from the URL path.
+    let config = ServerConfig { allow_implicit_codec: true, ..Default::default() };
+    let (addr, _handle) = bind_and_serve(routes, config).await.unwrap();
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/echo.v1.Echo/Hang"))
         .await
         .unwrap();
 

@@ -18,9 +18,12 @@ fn frame(kind: Kind) -> TungMessage {
 #[tokio::test]
 async fn streaming_round_trip() {
     let routes = Routes::new(EchoServer::new(EchoSvc::default()));
-    let (addr, _handle) = bind_and_serve(routes, ServerConfig::default()).await.unwrap();
+    // No codec subprotocol on the test connection -> allow first-frame inference.
+    // Single-stream mode takes the method from the URL path.
+    let config = ServerConfig { allow_implicit_codec: true, ..Default::default() };
+    let (addr, _handle) = bind_and_serve(routes, config).await.unwrap();
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/echo.v1.Echo/Stream"))
         .await
         .unwrap();
 

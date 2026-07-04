@@ -3,28 +3,50 @@
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
-use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Subscribe};
+use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Message as WsMessage, Subscribe};
 use grpc_webnext_core::{decode_frame, encode_frame, Transcoder};
 use grpc_webnext_server::{bind_and_serve, ServerConfig, CT_JSON};
 use prost::Message as _;
 use testecho::pb::echo_server::EchoServer;
 use testecho::pb::{EchoRequest, EchoResponse};
 use testecho::EchoSvc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tonic::service::Routes;
 
 const CT_JSON_STR: &str = CT_JSON;
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connect a WebSocket with an optional `Sec-WebSocket-Protocol` value.
+async fn ws_connect(url: &str, subprotocol: Option<&str>) -> Ws {
+    let mut req = url.into_client_request().unwrap();
+    if let Some(sp) = subprotocol {
+        req.headers_mut().insert("sec-websocket-protocol", sp.parse().unwrap());
+    }
+    tokio_tungstenite::connect_async(req).await.unwrap().0
+}
 
 fn bin(kind: Kind) -> TungMessage {
     TungMessage::Binary(encode_frame(&Frame { kind: Some(kind) }))
 }
 
 async fn start_json_server() -> String {
+    start_json_server_impl(false).await
+}
+
+/// A server that also allows implicit-codec access to main endpoints (no
+/// content-type / blank WS subprotocol / `application/json`).
+async fn start_json_server_lax() -> String {
+    start_json_server_impl(true).await
+}
+
+async fn start_json_server_impl(allow_implicit_codec: bool) -> String {
     let transcoder = Arc::new(Transcoder::from_file_descriptor_set(testecho::FILE_DESCRIPTOR_SET).unwrap());
     let routes = Routes::new(EchoServer::new(EchoSvc::default()));
     let (addr, _handle) = bind_and_serve(
         routes,
-        ServerConfig { transcoder: Some(transcoder), ..Default::default() },
+        ServerConfig { transcoder: Some(transcoder), allow_implicit_codec, ..Default::default() },
     )
     .await
     .unwrap();
@@ -74,28 +96,21 @@ fn text(json: serde_json::Value) -> tokio_tungstenite::tungstenite::Message {
 
 #[tokio::test]
 async fn streaming_json_round_trip() {
-    // Native JSON WebSocket: text frames with native-JSON messages.
+    // Single-stream JSON (default): the WS URL is the route, so frames carry no
+    // `streamId` and no `method`. First inbound frame opens the stream.
     let base = start_json_server().await;
-    let url = base.replacen("http", "ws", 1);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("{}/echo.v1.Echo/Stream", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, Some("grpc-webnext+json")).await;
 
-    // Flat frames: open (has method), data (has message), half-close, terminal (status).
-    ws.send(text(serde_json::json!({
-        "streamId": 1, "method": "/echo.v1.Echo/Stream", "message": {"message": "a"}
-    })))
-    .await
-    .unwrap();
-    ws.send(text(serde_json::json!({ "streamId": 1, "message": {"message": "b"} })))
-        .await
-        .unwrap();
-    ws.send(text(serde_json::json!({ "streamId": 1, "halfClose": true })))
-        .await
-        .unwrap();
+    ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
+    ws.send(text(serde_json::json!({ "message": {"message": "b"} }))).await.unwrap();
+    ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
 
     let mut echoed = Vec::new();
     while let Some(msg) = ws.next().await {
-        let tokio_tungstenite::tungstenite::Message::Text(t) = msg.unwrap() else { continue };
+        let TungMessage::Text(t) = msg.unwrap() else { continue };
         let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert!(jf.get("streamId").is_none(), "single-stream frames omit streamId");
         if jf.get("status").is_some() {
             assert_eq!(jf["status"]["code"], 0);
             break;
@@ -107,12 +122,30 @@ async fn streaming_json_round_trip() {
 }
 
 #[tokio::test]
-async fn unary_application_json_alias() {
-    // `application/json` is accepted as an alias for the JSON codec, and the
-    // response echoes the request's content-type.
+async fn main_endpoint_rejects_plain_content_types_by_default() {
+    // On a main endpoint, plain `application/json` and no content-type are rejected
+    // (415) by default — main endpoints need an explicit grpc-webnext content-type.
     let base = start_json_server().await;
+    for ct in [Some("application/json"), None] {
+        let mut req = reqwest::Client::new()
+            .post(format!("{base}/echo.v1.Echo/Unary"))
+            .body(r#"{"message":"plain"}"#);
+        if let Some(ct) = ct {
+            req = req.header("content-type", ct);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), 415, "content-type {ct:?} should be rejected on a main endpoint");
+    }
+}
+
+#[tokio::test]
+async fn implicit_codec_flag_allows_plain_json_on_main_endpoint() {
+    // With `allow_implicit_codec`, plain `application/json` / no content-type reach
+    // main endpoints and default to JSON (response is `application/json`).
+    // With the flag on, plain JSON reaches a main gRPC method path.
+    let base = start_json_server_lax().await;
     let resp = reqwest::Client::new()
-        .post(format!("{base}/echo.v1.Echo/Unary"))
+        .post(format!("{base}/echo.v1.Echo/FlakyUnary"))
         .header("content-type", "application/json")
         .body(r#"{"message":"plain"}"#)
         .send()
@@ -121,38 +154,228 @@ async fn unary_application_json_alias() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
     assert_eq!(resp.headers().get("grpc-status").unwrap(), "0");
-
-    let body = resp.bytes().await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
     assert_eq!(json["message"], "plain");
 }
 
 #[tokio::test]
-async fn ws_locks_to_text_on_first_text_frame() {
+async fn implicit_codec_flag_allows_plain_json_on_annotated_rpc_main_path() {
+    // With the flag on, plain JSON reaches ANY main path — the annotation just adds a
+    // REST alias, it doesn't lock the gRPC method path.
+    let base = start_json_server_lax().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/echo.v1.Echo/Unary")) // Unary is annotated
+        .header("content-type", "application/json")
+        .body(r#"{"message":"x"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(json["message"], "x");
+}
+
+#[tokio::test]
+async fn fetch_proto_on_rest_url_is_rejected() {
+    // Binary on a REST-annotated URL is the wrong surface -> explicit 415.
+    let base = start_json_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/echo"))
+        .header("content-type", "application/grpc-webnext+proto")
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 415);
+}
+
+#[tokio::test]
+async fn fetch_grpc_webnext_json_transcodes_on_rest_url() {
+    // grpc-webnext+json is JSON, so it also works on a REST URL -> transcode.
+    let base = start_json_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/echo"))
+        .header("content-type", CT_JSON_STR)
+        .body(r#"{"message":"sdkjson"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "0");
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(json["message"], "sdkjson");
+}
+
+#[tokio::test]
+async fn fetch_unknown_content_type_is_rejected() {
+    let base = start_json_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/echo.v1.Echo/Unary"))
+        .header("content-type", "text/plain")
+        .body("hi")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 415);
+}
+
+#[tokio::test]
+async fn fetch_json_unknown_method_is_unimplemented() {
+    // A JSON call to a nonexistent method fails explicitly (UNIMPLEMENTED), not via a
+    // vague transcode error.
+    let base = start_json_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/echo.v1.Echo/Nope"))
+        .header("content-type", CT_JSON_STR)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "12");
+}
+
+#[tokio::test]
+async fn implicit_codec_flag_allows_no_content_type_on_main_endpoint() {
+    // With the flag, a plain `curl` (no content-type) to a main endpoint works.
+    let base = start_json_server_lax().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/echo.v1.Echo/FlakyUnary")) // un-annotated
+        .body(r#"{"message":"bare"}"#) // note: no content-type header
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "0");
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(json["message"], "bare");
+}
+
+#[tokio::test]
+async fn ws_rejects_missing_codec_subprotocol_by_default() {
+    // A WebSocket with no codec subprotocol is rejected (UNIMPLEMENTED -> close 4012).
     let base = start_json_server().await;
     let url = base.replacen("http", "ws", 1);
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut closed = None;
+    while let Some(msg) = ws.next().await {
+        if let TungMessage::Close(cf) = msg.unwrap() {
+            closed = cf;
+            break;
+        }
+    }
+    let cf = closed.expect("expected a close frame");
+    assert_eq!(u16::from(cf.code), 4000 + tonic::Code::Unimplemented as u16);
+}
 
-    // First frame is text -> connection locked to JSON.
-    ws.send(text(serde_json::json!({
-        "streamId": 1, "method": "/echo.v1.Echo/Stream", "message": {"message": "a"}
-    })))
-    .await
-    .unwrap();
-    // A later binary frame must be dropped (locked to text).
-    ws.send(bin(Kind::Subscribe(Subscribe {
-        stream_id: 2,
-        method: "/echo.v1.Echo/Stream".into(),
-        headers: vec![],
-        timeout_millis: 0,
-        initial_payload: EchoRequest { message: "b".into() }.encode_to_vec(),
-        json: false,
-    })))
-    .await
-    .unwrap();
-    ws.send(text(serde_json::json!({ "streamId": 1, "halfClose": true })))
+#[tokio::test]
+async fn transcode_get_binds_path_param() {
+    // GET /v1/echo/{message} -> Unary, binding `message` from the path.
+    let base = start_json_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/v1/echo/hello%20world"))
+        .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "0");
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(json["message"], "hello world");
+}
+
+#[tokio::test]
+async fn transcode_post_body_wildcard() {
+    // POST /v1/echo with `body: "*"` -> the whole JSON body is the request message.
+    let base = start_json_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/echo"))
+        .header("content-type", "application/json")
+        .body(r#"{"message":"posted"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "0");
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(json["message"], "posted");
+}
+
+#[tokio::test]
+async fn transcode_get_binds_query_number() {
+    // GET /v1/sleep?millis=0 -> Sleep, coercing the uint32 field from a query param.
+    let base = start_json_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/v1/sleep?millis=0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "0");
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(json["message"], "awake");
+}
+
+#[tokio::test]
+async fn transcode_unmatched_path_falls_back_to_direct_when_implicit() {
+    // With the flag, a plain-JSON path with no REST binding falls back to a direct
+    // /pkg.Service/Method call.
+    let base = start_json_server_lax().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/echo.v1.Echo/FlakyUnary")) // un-annotated -> direct fallback
+        .header("content-type", "application/json")
+        .body(r#"{"message":"direct"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "0");
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(json["message"], "direct");
+}
+
+#[tokio::test]
+async fn ws_subprotocol_pins_codec_to_json() {
+    let base = start_json_server().await;
+    let url = format!("{}/echo.v1.Echo/Stream", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, Some("grpc-webnext+json")).await;
+
+    // A binary frame first would normally lock to proto, but the subprotocol pinned
+    // JSON up front, so it is dropped.
+    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".to_vec() }))).await.unwrap();
+    // Text opens the stream and echoes.
+    ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
+    ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
+
+    let mut echoed = Vec::new();
+    while let Some(msg) = ws.next().await {
+        match msg.unwrap() {
+            TungMessage::Binary(_) => panic!("binary frame on a json-pinned connection"),
+            TungMessage::Text(t) => {
+                let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if jf.get("status").is_some() {
+                    break;
+                } else if let Some(m) = jf.get("message") {
+                    echoed.push(m["message"].as_str().unwrap().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(echoed, vec!["a"]);
+}
+
+#[tokio::test]
+async fn ws_locks_to_text_on_first_text_frame() {
+    // Blank subprotocol -> codec inferred from the first frame (implicit/lax).
+    let base = start_json_server_lax().await;
+    let url = format!("{}/echo.v1.Echo/Stream", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, None).await;
+
+    // First frame text -> locked to JSON; opens the single stream.
+    ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
+    // A later binary frame must be dropped (locked to text).
+    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".to_vec() }))).await.unwrap();
+    ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
 
     let mut echoed = Vec::new();
     while let Some(msg) = ws.next().await {
@@ -160,7 +383,6 @@ async fn ws_locks_to_text_on_first_text_frame() {
             TungMessage::Binary(_) => panic!("binary frame on a text-locked connection"),
             TungMessage::Text(t) => {
                 let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
-                assert_eq!(jf["streamId"], 1, "stream 2 (binary) should have been dropped");
                 if jf.get("status").is_some() {
                     break;
                 } else if let Some(m) = jf.get("message") {
@@ -175,14 +397,15 @@ async fn ws_locks_to_text_on_first_text_frame() {
 
 #[tokio::test]
 async fn ws_locks_to_binary_on_first_binary_frame() {
-    let base = start_json_server().await;
-    let url = base.replacen("http", "ws", 1);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    // Blank subprotocol -> codec inferred from the first frame (implicit/lax).
+    let base = start_json_server_lax().await;
+    let url = format!("{}/echo.v1.Echo/Stream", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, None).await;
 
-    // First frame is binary -> connection locked to protobuf.
+    // First frame binary -> locked to protobuf; opens the stream (method from URL).
     ws.send(bin(Kind::Subscribe(Subscribe {
         stream_id: 1,
-        method: "/echo.v1.Echo/Stream".into(),
+        method: String::new(), // ignored in single-stream mode; taken from the URL
         headers: vec![],
         timeout_millis: 0,
         initial_payload: EchoRequest { message: "a".into() }.encode_to_vec(),
@@ -191,33 +414,148 @@ async fn ws_locks_to_binary_on_first_binary_frame() {
     .await
     .unwrap();
     // A later text frame must be dropped (locked to binary).
-    ws.send(text(serde_json::json!({
-        "streamId": 2, "method": "/echo.v1.Echo/Stream", "message": {"message": "b"}
-    })))
-    .await
-    .unwrap();
-    ws.send(bin(Kind::HalfClose(HalfClose { stream_id: 1 })))
-        .await
-        .unwrap();
+    ws.send(text(serde_json::json!({ "message": {"message": "b"} }))).await.unwrap();
+    ws.send(bin(Kind::HalfClose(HalfClose { stream_id: 1 }))).await.unwrap();
 
     let mut echoed = Vec::new();
     while let Some(msg) = ws.next().await {
         match msg.unwrap() {
             TungMessage::Text(_) => panic!("text frame on a binary-locked connection"),
             TungMessage::Binary(data) => match decode_frame(&data).unwrap().kind.unwrap() {
-                Kind::Header(h) => assert_eq!(h.stream_id, 1),
-                Kind::Message(m) => {
-                    assert_eq!(m.stream_id, 1, "stream 2 (text) should have been dropped");
-                    echoed.push(EchoResponse::decode(&m.payload[..]).unwrap().message);
-                }
-                Kind::Trailer(t) => {
-                    assert_eq!(t.stream_id, 1);
-                    break;
-                }
+                Kind::Header(_) => {}
+                Kind::Message(m) => echoed.push(EchoResponse::decode(&m.payload[..]).unwrap().message),
+                Kind::Trailer(_) => break,
                 other => panic!("unexpected: {other:?}"),
             },
             _ => {}
         }
     }
     assert_eq!(echoed, vec!["a"]);
+}
+
+#[tokio::test]
+async fn ws_annotation_server_stream() {
+    // A streaming method reached via its annotation URL: GET /v1/repeat/{message}?count=N.
+    // Annotation routes accept a blank subprotocol and lock to text; the request is
+    // built entirely from the URL (path `message`, query `count`).
+    let base = start_json_server().await;
+    let url = format!("{}/v1/repeat/hi?count=3", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, None).await;
+
+    // An (empty) open frame starts the stream; the server injects the request from the URL.
+    ws.send(text(serde_json::json!({}))).await.unwrap();
+
+    let mut got = Vec::new();
+    while let Some(msg) = ws.next().await {
+        let TungMessage::Text(t) = msg.unwrap() else { continue };
+        let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert!(jf.get("streamId").is_none(), "annotation routes are single-stream");
+        if jf.get("status").is_some() {
+            assert_eq!(jf["status"]["code"], 0);
+            break;
+        } else if let Some(m) = jf.get("message") {
+            got.push(m["message"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(got, vec!["hi", "hi", "hi"]);
+}
+
+#[tokio::test]
+async fn ws_annotation_bidi_with_body() {
+    // A bidi method reached via `post: "/v1/stream" body:"*"`: each text frame's body
+    // is a request message.
+    let base = start_json_server().await;
+    let url = format!("{}/v1/chat", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, Some("application/json")).await;
+
+    ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
+    ws.send(text(serde_json::json!({ "message": {"message": "b"} }))).await.unwrap();
+    ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
+
+    let mut got = Vec::new();
+    while let Some(msg) = ws.next().await {
+        let TungMessage::Text(t) = msg.unwrap() else { continue };
+        let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if jf.get("status").is_some() {
+            break;
+        } else if let Some(m) = jf.get("message") {
+            got.push(m["message"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(got, vec!["a", "b"]);
+}
+
+#[tokio::test]
+async fn ws_annotation_rejects_proto_subprotocol() {
+    // Annotation routes are single-stream JSON: a binary (proto) subprotocol is the
+    // wrong surface -> close 4009 (FAILED_PRECONDITION).
+    let base = start_json_server().await;
+    let url = format!("{}/v1/repeat/hi?count=1", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, Some("grpc-webnext+proto")).await;
+    let mut closed = None;
+    while let Some(msg) = ws.next().await {
+        if let TungMessage::Close(cf) = msg.unwrap() {
+            closed = cf;
+            break;
+        }
+    }
+    let cf = closed.expect("expected a close frame");
+    assert_eq!(u16::from(cf.code), 4000 + tonic::Code::FailedPrecondition as u16);
+}
+
+#[tokio::test]
+async fn ws_annotation_accepts_grpc_webnext_json() {
+    // grpc-webnext+json is JSON, so it is accepted on a REST route (like blank /
+    // application/json).
+    let base = start_json_server().await;
+    let url = format!("{}/v1/repeat/hi?count=2", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, Some("grpc-webnext+json")).await;
+    ws.send(text(serde_json::json!({}))).await.unwrap();
+
+    let mut got = Vec::new();
+    while let Some(msg) = ws.next().await {
+        let TungMessage::Text(t) = msg.unwrap() else { continue };
+        let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if jf.get("status").is_some() {
+            break;
+        } else if let Some(m) = jf.get("message") {
+            got.push(m["message"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(got, vec!["hi", "hi"]);
+}
+
+#[tokio::test]
+async fn ws_multiplex_two_streams() {
+    // `+multi`: one socket carries two concurrent streams; frames carry streamId + method.
+    let base = start_json_server().await;
+    let url = base.replacen("http", "ws", 1); // base URL (not a method) for multiplexing
+    let mut ws = ws_connect(&url, Some("grpc-webnext+json+multi")).await;
+
+    for (sid, msg) in [(1, "one"), (2, "two")] {
+        ws.send(text(serde_json::json!({
+            "streamId": sid, "method": "/echo.v1.Echo/Stream", "message": {"message": msg}
+        })))
+        .await
+        .unwrap();
+        ws.send(text(serde_json::json!({ "streamId": sid, "halfClose": true }))).await.unwrap();
+    }
+
+    let mut got: std::collections::HashMap<u64, String> = Default::default();
+    let mut done = 0;
+    while let Some(msg) = ws.next().await {
+        let TungMessage::Text(t) = msg.unwrap() else { continue };
+        let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
+        let sid = jf["streamId"].as_u64().unwrap();
+        if jf.get("status").is_some() {
+            done += 1;
+            if done == 2 {
+                break;
+            }
+        } else if let Some(m) = jf.get("message") {
+            got.insert(sid, m["message"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(got.get(&1).map(String::as_str), Some("one"));
+    assert_eq!(got.get(&2).map(String::as_str), Some("two"));
 }

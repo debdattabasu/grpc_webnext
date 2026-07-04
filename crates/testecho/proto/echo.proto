@@ -2,16 +2,40 @@ syntax = "proto3";
 
 package echo.v1;
 
+import "google/api/annotations.proto";
+
 service Echo {
-  // Unary: returns the same message.
-  rpc Unary(EchoRequest) returns (EchoResponse);
-  // Bidi streaming: echoes each message back.
+  // Unary: returns the same message. Also exposed as REST via HTTP transcoding:
+  //   POST /v1/echo          { "message": "hi" }
+  //   GET  /v1/echo/{message}
+  rpc Unary(EchoRequest) returns (EchoResponse) {
+    option (google.api.http) = {
+      post: "/v1/echo"
+      body: "*"
+      additional_bindings { get: "/v1/echo/{message}" }
+    };
+  }
+  // Bidi streaming: echoes each message back. (Un-annotated: reached only over the
+  // main WebSocket surface.)
   rpc Stream(stream EchoRequest) returns (stream EchoResponse);
+  // Bidi streaming echo, exposed as a REST-transcoded stream:
+  //   POST /v1/chat   (each frame's JSON body is a request message)
+  rpc Chat(stream EchoRequest) returns (stream EchoResponse) {
+    option (google.api.http) = { post: "/v1/chat" body: "*" };
+  }
+  // Server streaming that emits `message` `count` times, then completes. REST:
+  //   GET /v1/repeat/{message}?count=N  (request built entirely from the URL)
+  rpc Repeat(RepeatRequest) returns (stream EchoResponse) {
+    option (google.api.http) = { get: "/v1/repeat/{message}" };
+  }
   // Server streaming that emits one message then hangs forever; used to observe
   // upstream cancellation when the client resets/disconnects.
   rpc Hang(EchoRequest) returns (stream EchoResponse);
   // Unary that sleeps `millis` before replying; used to exercise deadlines.
-  rpc Sleep(SleepRequest) returns (EchoResponse);
+  // REST: GET /v1/sleep?millis=N  (numeric field bound from a query param).
+  rpc Sleep(SleepRequest) returns (EchoResponse) {
+    option (google.api.http) = { get: "/v1/sleep" };
+  }
   // Unary that fails with UNAVAILABLE a preset number of times, then succeeds;
   // used to exercise retry.
   rpc FlakyUnary(EchoRequest) returns (EchoResponse);
@@ -19,6 +43,11 @@ service Echo {
 
 message SleepRequest {
   uint32 millis = 1;
+}
+
+message RepeatRequest {
+  string message = 1;
+  uint32 count = 2;
 }
 
 message EchoRequest {

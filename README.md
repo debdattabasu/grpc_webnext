@@ -34,7 +34,7 @@ All three deliverables work end-to-end, covered by integration tests
 Binary protobuf and JSON are both wired. Deadlines (local + forwarded),
 cancellation propagation, and unary retry are done on the proxy; JSON transcoding
 is served by the native library. Remaining polish (streaming retry, backpressure,
-JSON-in-the-proxy) is tracked in [BACKLOG.md](BACKLOG.md).
+JSON-in-the-proxy) is tracked in [doc/BACKLOG.md](doc/BACKLOG.md).
 
 ## Quickstart
 
@@ -96,8 +96,8 @@ grpc_webnext_server::serve(listener, routes, Default::default()).await?;
 - **Schema-agnostic proxy.** A passthrough `BytesCodec` forwards message bytes
   without needing the `.proto`.
 
-See [PROTOCOL.md](PROTOCOL.md) for the wire format and
-[COMPATIBILITY.md](COMPATIBILITY.md) for per-transport gRPC-semantics fidelity.
+See [doc/PROTOCOL.md](doc/PROTOCOL.md) for the wire format and
+[doc/COMPATIBILITY.md](doc/COMPATIBILITY.md) for per-transport gRPC-semantics fidelity.
 
 ## Repository layout
 

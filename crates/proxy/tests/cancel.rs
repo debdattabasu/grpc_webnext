@@ -25,7 +25,8 @@ async fn proxy_for_hang() -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) 
     })
     .await
     .unwrap();
-    (format!("ws://{proxy_addr}/"), cancel_rx)
+    // Single-stream: the method is the WS URL path.
+    (format!("ws://{proxy_addr}/echo.v1.Echo/Hang"), cancel_rx)
 }
 
 fn subscribe(stream_id: u32) -> TungMessage {
@@ -50,9 +51,12 @@ async fn caps_concurrent_streams() {
     .await
     .unwrap();
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{proxy_addr}/"))
-        .await
-        .unwrap();
+    // Two streams on one socket -> multiplexed (method comes from each Subscribe).
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{proxy_addr}/").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "grpc-webnext+proto+multi".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
 
     // First stream is accepted (starts, emits a Message); second is rejected.
     ws.send(subscribe(1)).await.unwrap();

@@ -11,22 +11,26 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 
-use grpc_webnext_core::json_frame::{decode_json_frame, encode_json_frame, json_frame_to_proto, proto_frame_to_json};
+use grpc_webnext_core::json_frame::{
+    decode_json_frame, encode_json_frame, json_frame_to_proto, json_open_to_subscribe, proto_frame_to_json,
+};
 use grpc_webnext_core::pb::{frame::Kind, Frame, Header, Message as WsMessage, Reset, Trailer};
-use grpc_webnext_core::{decode_frame, encode_frame, grpc_frame, metadata, Deframer, Transcoder};
+use grpc_webnext_core::{decode_frame, encode_frame, grpc_frame, metadata, Deframer, Transcoder, WsBinding};
 use http::uri::PathAndQuery;
 use http::{HeaderMap, Request};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame as BodyFrame;
+use hyper_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use hyper_tungstenite::tungstenite::protocol::CloseFrame;
 use hyper_tungstenite::tungstenite::Message as TungMessage;
 use hyper_tungstenite::HyperWebsocket;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::body::Body as TonicBody;
 use tonic::service::Routes;
-use tonic::Code;
+use tonic::{Code, Status};
 
-use crate::{ServerConfig, CT_GRPC};
+use crate::{ServerConfig, StreamAuthFn, CT_GRPC};
 
 struct StreamState {
     /// Feeds request messages into the gRPC request body; `None` after half-close.
@@ -34,8 +38,29 @@ struct StreamState {
     task: tokio::task::JoinHandle<()>,
 }
 
-pub async fn serve(routes: Routes, websocket: HyperWebsocket, config: ServerConfig) {
+/// Per-connection WebSocket parameters resolved from the handshake.
+pub struct WsParams {
+    /// `Some(true)` = JSON/text, `Some(false)` = proto/binary, `None` = infer from
+    /// the first frame (only reachable with implicit codecs).
+    pub codec: Option<bool>,
+    /// Multiplexing enabled (`+multi` subprotocol): streams carry `stream_id`/`method`.
+    pub multi: bool,
+    /// Single-stream mode only: the gRPC method taken from the WS URL path.
+    pub method: Option<String>,
+    /// Annotation route: the WS URL matched a `google.api.http` binding, so the method
+    /// comes from the binding and each request message is built from path/query + body.
+    pub annotation: Option<Arc<WsBinding>>,
+}
+
+pub async fn serve(
+    routes: Routes,
+    websocket: HyperWebsocket,
+    config: ServerConfig,
+    reject: Option<Status>,
+    params: WsParams,
+) {
     let transcoder = config.transcoder.clone();
+    let stream_auth = config.stream_auth.clone();
     let ws = match websocket.await {
         Ok(ws) => ws,
         Err(e) => {
@@ -44,6 +69,15 @@ pub async fn serve(routes: Routes, websocket: HyperWebsocket, config: ServerConf
         }
     };
     let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // Connection gate rejected this handshake: hand the client a readable gRPC
+    // status via a private close code, then drop the socket without ever reading
+    // a frame or creating a stream.
+    if let Some(status) = reject {
+        let _ = ws_sink.send(close_for_status(&status)).await;
+        let _ = ws_sink.close().await;
+        return;
+    }
 
     // The outbound channel carries ready-to-send WebSocket messages so each
     // stream can pick its codec (text JSON vs binary protobuf).
@@ -58,10 +92,15 @@ pub async fn serve(routes: Routes, websocket: HyperWebsocket, config: ServerConf
         }
     });
 
+    let multi = params.multi;
+    let annotation = params.annotation;
+    let method_url = params.method.unwrap_or_default();
     let mut streams: HashMap<u32, StreamState> = HashMap::new();
-    // The connection is locked to a codec by its first frame: text -> JSON,
-    // binary -> protobuf. Later frames of the other type are dropped.
-    let mut codec: Option<bool> = None;
+    // Connection codec (true = JSON/text, false = proto/binary). A codec subprotocol
+    // pins it up front; otherwise (implicit) it locks to the first frame's type.
+    let mut codec: Option<bool> = params.codec;
+    // Single-stream mode: whether the one stream has been opened by a first frame.
+    let mut opened = false;
 
     loop {
         tokio::select! {
@@ -69,29 +108,24 @@ pub async fn serve(routes: Routes, websocket: HyperWebsocket, config: ServerConf
             incoming = ws_stream.next() => {
                 let Some(incoming) = incoming else { break };
                 let msg = match incoming { Ok(m) => m, Err(_) => break };
-                let (frame, json) = match msg {
+                let decoded = match msg {
                     TungMessage::Binary(data) => {
                         if *codec.get_or_insert(false) {
                             continue; // locked to JSON/text
                         }
-                        match decode_frame(&data) {
-                            Ok(f) => (f, false),
-                            Err(_) => continue,
-                        }
+                        decode_binary(&data, multi, &method_url, &mut opened).map(|f| (f, false))
                     }
                     TungMessage::Text(text) => {
                         if !*codec.get_or_insert(true) {
                             continue; // locked to proto/binary
                         }
-                        match decode_json_frame(&text) {
-                            Ok(f) => (json_frame_to_proto(f), true),
-                            Err(_) => continue,
-                        }
+                        decode_text(&text, multi, &method_url, &mut opened).map(|f| (f, true))
                     }
                     TungMessage::Close(_) => break,
                     _ => continue,
                 };
-                handle_frame(frame, json, &routes, &transcoder, &outbound_tx, &done_tx, &mut streams).await;
+                let Some((frame, json)) = decoded else { continue };
+                handle_frame(frame, json, multi, &annotation, &routes, &transcoder, &stream_auth, &outbound_tx, &done_tx, &mut streams).await;
             }
         }
     }
@@ -103,21 +137,88 @@ pub async fn serve(routes: Routes, websocket: HyperWebsocket, config: ServerConf
     let _ = writer.await;
 }
 
-/// Build the WebSocket message for a frame in the stream's codec.
-fn to_tung(frame: &Frame, json: bool) -> TungMessage {
+/// Decode an inbound binary (proto) frame into an internal `Frame`. In single-stream
+/// mode the stream is normalized to id 1 and the `Subscribe` method comes from the
+/// URL; a non-`Subscribe` before the stream opens is dropped.
+fn decode_binary(data: &[u8], multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+    let mut frame = decode_frame(data).ok()?;
+    if !multi {
+        match frame.kind.as_mut()? {
+            Kind::Subscribe(s) => {
+                s.stream_id = 1;
+                s.method = method_url.to_string();
+                *opened = true;
+            }
+            _ if !*opened => return None, // must open with a Subscribe first
+            Kind::Message(m) => m.stream_id = 1,
+            Kind::HalfClose(h) => h.stream_id = 1,
+            Kind::Reset(r) => r.stream_id = 1,
+            _ => {}
+        }
+    }
+    Some(frame)
+}
+
+/// Decode an inbound text (JSON) frame. In single-stream mode the first frame opens
+/// the one stream (method from the URL); later frames are messages/half-close/reset.
+fn decode_text(text: &str, multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+    let jf = decode_json_frame(text).ok()?;
+    if multi {
+        return Some(json_frame_to_proto(jf, 0));
+    }
+    if !*opened {
+        *opened = true;
+        let sub = json_open_to_subscribe(jf, method_url.to_string(), 1);
+        Some(Frame { kind: Some(Kind::Subscribe(sub)) })
+    } else {
+        Some(json_frame_to_proto(jf, 1))
+    }
+}
+
+/// Build the WebSocket message for a frame in the stream's codec (`multi` controls
+/// whether JSON frames carry `streamId`).
+fn to_tung(frame: &Frame, json: bool, multi: bool) -> TungMessage {
     if json {
-        if let Some(jf) = proto_frame_to_json(frame) {
+        if let Some(jf) = proto_frame_to_json(frame, multi) {
             return TungMessage::Text(encode_json_frame(&jf).into());
         }
     }
     TungMessage::Binary(encode_frame(frame))
 }
 
+/// A close frame that carries a gRPC status to browser JS: private close code
+/// `4000 + code` (gRPC codes are 0..=16, so 4000..=4016) and the message as the
+/// reason (WebSocket caps the reason at 123 bytes).
+fn close_for_status(status: &Status) -> TungMessage {
+    let code = 4000u16 + status.code() as u16;
+    TungMessage::Close(Some(CloseFrame {
+        code: CloseCode::from(code),
+        reason: truncate_utf8(status.message(), 123).to_string().into(),
+    }))
+}
+
+/// Truncate to at most `max` bytes on a char boundary.
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     frame: Frame,
     json: bool,
+    multi: bool,
+    annotation: &Option<Arc<WsBinding>>,
     routes: &Routes,
     transcoder: &Option<Arc<Transcoder>>,
+    stream_auth: &Option<StreamAuthFn>,
     outbound_tx: &mpsc::Sender<TungMessage>,
     done_tx: &mpsc::Sender<u32>,
     streams: &mut HashMap<u32, StreamState>,
@@ -126,27 +227,47 @@ async fn handle_frame(
         Some(Kind::Subscribe(sub)) => {
             let stream_id = sub.stream_id;
             if streams.contains_key(&stream_id) {
-                send_reset(outbound_tx, stream_id, json, Code::InvalidArgument, "stream_id in use").await;
+                send_reset(outbound_tx, stream_id, json, multi, Code::InvalidArgument, "stream_id in use").await;
                 return;
             }
             if json && transcoder.is_none() {
-                send_reset(outbound_tx, stream_id, json, Code::Unimplemented, "+json needs a transcoder").await;
+                send_reset(outbound_tx, stream_id, json, multi, Code::Unimplemented, "+json needs a transcoder").await;
                 return;
             }
             let path: PathAndQuery = match sub.method.parse() {
                 Ok(p) => p,
                 Err(_) => {
-                    send_reset(outbound_tx, stream_id, json, Code::InvalidArgument, "invalid method").await;
+                    send_reset(outbound_tx, stream_id, json, multi, Code::InvalidArgument, "invalid method").await;
                     return;
                 }
             };
+
+            // Per-stream authorization from the Subscribe metadata.
+            let md = metadata::metadata_vec_to_metadata(&sub.headers);
+            if let Some(auth) = stream_auth {
+                if let Err(status) = auth(&sub.method, &md) {
+                    send_reset(outbound_tx, stream_id, json, multi, status.code(), status.message()).await;
+                    return;
+                }
+            }
 
             let (req_tx, req_rx) = mpsc::channel::<Bytes>(16);
             if !sub.initial_payload.is_empty() {
                 let _ = req_tx.send(Bytes::from(sub.initial_payload)).await;
             }
 
-            let headers = metadata::metadata_vec_to_metadata(&sub.headers).into_headers();
+            // An annotation route with no body (GET-style server-stream) takes its
+            // single request entirely from the URL: inject one empty payload (the
+            // binding fills it from path/query) and half-close.
+            let mut req_tx_state = Some(req_tx.clone());
+            if let Some(ann) = annotation {
+                if !ann.has_body() {
+                    let _ = req_tx.send(Bytes::new()).await;
+                    req_tx_state = None;
+                }
+            }
+
+            let headers = md.into_headers();
             let timeout = metadata::grpc_timeout_from_millis(sub.timeout_millis);
 
             let task = tokio::spawn(run_stream(
@@ -159,9 +280,11 @@ async fn handle_frame(
                 outbound_tx.clone(),
                 done_tx.clone(),
                 json,
+                multi,
                 transcoder.clone(),
+                annotation.clone(),
             ));
-            streams.insert(stream_id, StreamState { req_tx: Some(req_tx), task });
+            streams.insert(stream_id, StreamState { req_tx: req_tx_state, task });
         }
         Some(Kind::Message(msg)) => {
             if let Some(state) = streams.get(&msg.stream_id) {
@@ -195,17 +318,23 @@ async fn run_stream(
     outbound_tx: mpsc::Sender<TungMessage>,
     done_tx: mpsc::Sender<u32>,
     json: bool,
+    multi: bool,
     transcoder: Option<Arc<Transcoder>>,
+    annotation: Option<Arc<WsBinding>>,
 ) {
     let method_path = path.path().to_string();
 
-    // Request body: a live stream of gRPC-framed messages, transcoding each
-    // JSON request message to protobuf when `json`.
+    // Request body: a live stream of gRPC-framed messages. Annotation routes build
+    // each message from the URL path/query + body; plain `+json` transcodes each
+    // JSON message; proto passes through.
     let req_tc = transcoder.clone();
+    let req_ann = annotation.clone();
     let req_path = method_path.clone();
     let body_stream = ReceiverStream::new(req_rx).map(move |payload| {
-        let proto = if json {
-            // A transcode failure yields empty bytes, which the router rejects.
+        // A transcode failure yields empty bytes, which the router rejects.
+        let proto = if let Some(ann) = &req_ann {
+            ann.build_message(&payload).map(Bytes::from).unwrap_or_default()
+        } else if json {
             req_tc
                 .as_ref()
                 .unwrap()
@@ -240,7 +369,7 @@ async fn run_stream(
         stream_id,
         headers: metadata::metadata_to_vec(&tonic::metadata::MetadataMap::from_headers(parts.headers.clone())),
     };
-    let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Header(header)) }, json)).await;
+    let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Header(header)) }, json, multi)).await;
 
     let mut deframer = Deframer::new();
     let mut trailers = HeaderMap::new();
@@ -259,7 +388,7 @@ async fn run_stream(
                     match transcoder.as_ref().unwrap().response_proto_to_json(&method_path, &msg) {
                         Ok(j) => j,
                         Err(e) => {
-                            send_reset(&outbound_tx, stream_id, json, Code::Internal, &format!("json encode: {e}")).await;
+                            send_reset(&outbound_tx, stream_id, json, multi, Code::Internal, &format!("json encode: {e}")).await;
                             let _ = done_tx.send(stream_id).await;
                             return;
                         }
@@ -268,7 +397,7 @@ async fn run_stream(
                     msg.to_vec()
                 };
                 let out = Frame { kind: Some(Kind::Message(WsMessage { stream_id, payload })) };
-                if outbound_tx.send(to_tung(&out, json)).await.is_err() {
+                if outbound_tx.send(to_tung(&out, json, multi)).await.is_err() {
                     let _ = done_tx.send(stream_id).await;
                     return;
                 }
@@ -287,7 +416,7 @@ async fn run_stream(
         status_message,
         trailers: metadata::metadata_to_vec(&tonic::metadata::MetadataMap::from_headers(trailers)),
     };
-    let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Trailer(trailer)) }, json)).await;
+    let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Trailer(trailer)) }, json, multi)).await;
     let _ = done_tx.send(stream_id).await;
 }
 
@@ -295,6 +424,7 @@ async fn send_reset(
     outbound_tx: &mpsc::Sender<TungMessage>,
     stream_id: u32,
     json: bool,
+    multi: bool,
     code: Code,
     message: &str,
 ) {
@@ -305,5 +435,5 @@ async fn send_reset(
             status_message: message.to_string(),
         })),
     };
-    let _ = outbound_tx.send(to_tung(&frame, json)).await;
+    let _ = outbound_tx.send(to_tung(&frame, json, multi)).await;
 }

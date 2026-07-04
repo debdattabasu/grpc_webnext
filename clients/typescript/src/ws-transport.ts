@@ -11,30 +11,42 @@ import type {
   UnaryResponse,
 } from "./transport.js";
 
+/** Base subprotocol; the codec (and `+multi`) are appended. */
+const WS_SUBPROTOCOL = "grpc-webnext";
+
 export interface WebSocketTransportOptions {
   /** Base URL, e.g. "http://localhost:8080"; scheme is mapped to ws/wss. */
   baseUrl: string;
-  /** Number of WebSockets in the multiplex pool (streams round-robin). Default 1. */
-  poolSize?: number;
   /** Override the WebSocket constructor (node needs the `ws` package). */
   webSocketImpl?: typeof WebSocket;
-  /** Message codec: "proto" (default) or "json". Sets `Subscribe.json`. */
+  /** Message codec: "proto" (default) or "json". */
   codec?: "proto" | "json";
+  /**
+   * Multiplex many streams over a pool of WebSockets (`+multi` subprotocol). Off by
+   * default — each stream gets its own WebSocket connected to the method's URL, and
+   * JSON frames are human-readable (no `streamId`/`method`).
+   */
+  multiplex?: boolean;
+  /** Number of WebSockets in the multiplex pool. Only used when `multiplex`. Default 1. */
+  poolSize?: number;
 }
 
-/** Streaming transport over WebSocket, with a client-side multiplex pool. */
+/** Streaming transport over WebSocket. */
 export class WebSocketTransport implements Transport {
-  private readonly url: string;
+  private readonly baseUrl: string;
   private readonly WS: typeof WebSocket;
-  private readonly pool: Conn[] = [];
-  private readonly poolSize: number;
   private readonly json: boolean;
+  private readonly multiplex: boolean;
+  private readonly poolSize: number;
+  private readonly pool: MultiplexConn[] = [];
+  private readonly singles = new Set<SingleStreamConn>();
   private next = 0;
 
   constructor(options: WebSocketTransportOptions) {
-    this.url = toWsUrl(options.baseUrl);
-    this.poolSize = Math.max(1, options.poolSize ?? 1);
+    this.baseUrl = options.baseUrl;
     this.json = options.codec === "json";
+    this.multiplex = options.multiplex ?? false;
+    this.poolSize = Math.max(1, options.poolSize ?? 1);
     const impl = options.webSocketImpl ?? (globalThis as any).WebSocket;
     if (!impl) {
       throw new Error(
@@ -49,18 +61,34 @@ export class WebSocketTransport implements Transport {
   }
 
   startStream(path: string, options: TransportCallOptions, handlers: StreamHandlers): StreamCall {
-    const conn = this.pickConn();
-    return conn.open(path, options, handlers);
+    if (this.multiplex) {
+      // A new pooled socket carries this call's credential in its subprotocol.
+      return this.pickConn(path, options.metadata).open(path, options, handlers);
+    }
+    // Single-stream: one WebSocket per stream, connected to the method's URL.
+    const url = methodWsUrl(this.baseUrl, path);
+    const conn = new SingleStreamConn(url, this.WS, this.json, options, handlers, () =>
+      this.singles.delete(conn),
+    );
+    this.singles.add(conn);
+    return conn.call;
   }
 
   close(): void {
     for (const conn of this.pool) conn.close();
     this.pool.length = 0;
+    for (const conn of [...this.singles]) conn.close();
+    this.singles.clear();
   }
 
-  private pickConn(): Conn {
+  private pickConn(path: string, metadata: Metadata): MultiplexConn {
     if (this.pool.length < this.poolSize) {
-      const conn = new Conn(this.url, this.WS, this.json);
+      const bearer = bearerSubprotocol(metadata);
+      // A pooled socket carrying a credential passes the opening call's method as
+      // a query param, so the server can authenticate the credential against it.
+      const base = toWsUrl(this.baseUrl);
+      const url = bearer ? `${base}?method=${encodeURIComponent(path)}` : base;
+      const conn = new MultiplexConn(url, this.WS, this.json, bearer);
       this.pool.push(conn);
       return conn;
     }
@@ -70,8 +98,190 @@ export class WebSocketTransport implements Transport {
   }
 }
 
-/** One WebSocket carrying multiple logical streams keyed by stream_id. */
-class Conn {
+/**
+ * One WebSocket carrying exactly one stream. The method is the WS URL, so JSON
+ * frames omit `streamId`/`method`.
+ */
+class SingleStreamConn {
+  private readonly ws: WebSocket;
+  private readonly enc = new TextEncoder();
+  private readonly dec = new TextDecoder();
+  private readonly pending: (string | Uint8Array)[] = [];
+  private open_ = false;
+  private finished = false;
+  readonly call: StreamCall;
+
+  constructor(
+    url: string,
+    WS: typeof WebSocket,
+    private readonly json: boolean,
+    options: TransportCallOptions,
+    private readonly handlers: StreamHandlers,
+    private readonly onDone: () => void,
+  ) {
+    const codecSub = json ? `${WS_SUBPROTOCOL}+json` : `${WS_SUBPROTOCOL}+proto`;
+    const protocols = [WS_SUBPROTOCOL, codecSub];
+    // Connection-level auth: this call's `authorization` metadata rides in the
+    // subprotocol so the server can hard-reject at the handshake (before any frame).
+    const bearer = bearerSubprotocol(options.metadata);
+    if (bearer) protocols.push(bearer);
+    this.ws = new WS(url, protocols);
+    this.ws.binaryType = "arraybuffer";
+    this.ws.addEventListener("open", () => {
+      this.open_ = true;
+      for (const frame of this.pending) this.ws.send(frame);
+      this.pending.length = 0;
+    });
+    this.ws.addEventListener("message", (ev: MessageEvent) => this.onMessage(ev));
+    this.ws.addEventListener("close", () => this.onClose());
+    this.ws.addEventListener("error", () => this.onClose());
+
+    // Eager open frame: carries metadata/deadline and unambiguously starts the stream.
+    this.sendOpen(options);
+
+    const signal = options.signal;
+    if (signal) {
+      const onAbort = () => this.terminate(statusForAbort(signal));
+      if (signal.aborted) queueMicrotask(onAbort);
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    this.call = {
+      send: (message) => this.sendRaw(this.encodeMessage(message)),
+      halfClose: () => this.sendRaw(this.encodeHalfClose()),
+      cancel: () =>
+        this.terminate({ code: Status.CANCELLED, details: "cancelled", metadata: new Metadata() }),
+    };
+  }
+
+  close(): void {
+    try {
+      this.ws.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private sendOpen(options: TransportCallOptions): void {
+    const timeoutMillis = options.timeoutMillis ? Math.ceil(options.timeoutMillis) : 0;
+    if (this.json) {
+      const open: Record<string, unknown> = {};
+      const metadata = metaToJson(options.metadata);
+      if (Object.keys(metadata).length) open.metadata = metadata;
+      if (timeoutMillis) open.timeoutMillis = timeoutMillis;
+      this.sendRaw(JSON.stringify(open));
+    } else {
+      this.sendRaw(
+        encodeFrame({
+          subscribe: {
+            streamId: 1,
+            method: "", // ignored by the server; taken from the URL
+            headers: options.metadata.toMetadatumList(),
+            timeoutMillis,
+            initialPayload: new Uint8Array(),
+            json: false,
+          },
+        }),
+      );
+    }
+  }
+
+  private encodeMessage(message: Uint8Array): string | Uint8Array {
+    return this.json
+      ? JSON.stringify({ message: JSON.parse(this.dec.decode(message)) })
+      : encodeFrame({ message: { streamId: 1, payload: message } });
+  }
+
+  private encodeHalfClose(): string | Uint8Array {
+    return this.json ? JSON.stringify({ halfClose: true }) : encodeFrame({ halfClose: { streamId: 1 } });
+  }
+
+  private encodeReset(status: StatusResult): string | Uint8Array {
+    return this.json
+      ? JSON.stringify({ status: { code: status.code, message: status.details } })
+      : encodeFrame({ reset: { streamId: 1, statusCode: status.code, statusMessage: status.details } });
+  }
+
+  private sendRaw(frame: string | Uint8Array): void {
+    if (this.finished) return;
+    if (this.open_) this.ws.send(frame);
+    else this.pending.push(frame);
+  }
+
+  private terminate(status: StatusResult): void {
+    if (this.finished) return;
+    this.sendRaw(this.encodeReset(status));
+    this.finish(status);
+    this.close();
+  }
+
+  private finish(status: StatusResult): void {
+    if (this.finished) return;
+    this.finished = true;
+    this.onDone();
+    this.handlers.onStatus?.(status);
+  }
+
+  private onMessage(ev: MessageEvent): void {
+    if (this.finished) return;
+    const data = ev.data;
+    if (typeof data === "string") {
+      this.onJsonFrame(data);
+      return;
+    }
+    const bytes =
+      data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : ArrayBuffer.isView(data)
+          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+          : null;
+    if (!bytes) return;
+    const frame = decodeFrame(bytes);
+    if (frame.header) {
+      this.handlers.onHeaders?.(Metadata.fromMetadatumList(frame.header.headers));
+    } else if (frame.message) {
+      this.handlers.onMessage?.(frame.message.payload);
+    } else if (frame.trailer) {
+      const t = frame.trailer;
+      this.finish({
+        code: t.statusCode as Status,
+        details: t.statusMessage,
+        metadata: Metadata.fromMetadatumList(t.trailers),
+      });
+    } else if (frame.reset) {
+      const r = frame.reset;
+      this.finish({ code: r.statusCode as Status, details: r.statusMessage, metadata: new Metadata() });
+    }
+  }
+
+  private onJsonFrame(text: string): void {
+    let jf: any;
+    try {
+      jf = JSON.parse(text);
+    } catch {
+      return;
+    }
+    if (jf.status) {
+      this.finish({
+        code: jf.status.code as Status,
+        details: jf.status.message ?? "",
+        metadata: jsonToMeta(jf.metadata),
+      });
+    } else if (jf.message !== undefined) {
+      this.handlers.onMessage?.(this.enc.encode(JSON.stringify(jf.message)));
+    } else if (jf.metadata) {
+      this.handlers.onHeaders?.(jsonToMeta(jf.metadata));
+    }
+  }
+
+  private onClose(): void {
+    this.open_ = false;
+    this.finish({ code: Status.UNAVAILABLE, details: "websocket closed", metadata: new Metadata() });
+  }
+}
+
+/** One WebSocket carrying multiple logical streams keyed by stream_id (`+multi`). */
+class MultiplexConn {
   private readonly ws: WebSocket;
   private readonly streams = new Map<number, StreamHandlers>();
   private readonly pending: (string | Uint8Array)[] = [];
@@ -84,8 +294,13 @@ class Conn {
     url: string,
     WS: typeof WebSocket,
     private readonly json: boolean,
+    bearer?: string,
   ) {
-    this.ws = new WS(url);
+    const codecSub = json ? `${WS_SUBPROTOCOL}+json+multi` : `${WS_SUBPROTOCOL}+proto+multi`;
+    const protocols = [WS_SUBPROTOCOL, codecSub];
+    // The subprotocol credential (if any) gates this pooled socket at the handshake.
+    if (bearer) protocols.push(bearer);
+    this.ws = new WS(url, protocols);
     this.ws.binaryType = "arraybuffer";
     this.ws.addEventListener("open", () => {
       this.open_ = true;
@@ -103,7 +318,6 @@ class Conn {
 
     const timeoutMillis = options.timeoutMillis ? Math.ceil(options.timeoutMillis) : 0;
     if (this.json) {
-      // Flat open frame: has `method`.
       const frame: Record<string, unknown> = { streamId, method: path };
       const metadata = metaToJson(options.metadata);
       if (Object.keys(metadata).length) frame.metadata = metadata;
@@ -124,21 +338,14 @@ class Conn {
       );
     }
 
-    // Terminate the stream: send a Reset and deliver the status locally so
-    // consumers (for-await) stop.
     const terminate = (status: StatusResult) => {
-      const handlers = this.streams.get(streamId);
-      if (!handlers) return; // already finished/cancelled
+      const h = this.streams.get(streamId);
+      if (!h) return;
       this.streams.delete(streamId);
       this.sendRaw(this.encodeReset(streamId, status));
-      handlers.onStatus?.(status);
+      h.onStatus?.(status);
     };
 
-    const cancel = () =>
-      terminate({ code: Status.CANCELLED, details: "cancelled", metadata: new Metadata() });
-
-    // AbortSignal -> Reset (the call's `context`). Deadline aborts report
-    // DEADLINE_EXCEEDED; any other abort is CANCELLED.
     const signal = options.signal;
     if (signal) {
       const onAbort = () => terminate(statusForAbort(signal));
@@ -149,7 +356,8 @@ class Conn {
     return {
       send: (message) => this.sendRaw(this.encodeMessage(streamId, message)),
       halfClose: () => this.sendRaw(this.encodeHalfClose(streamId)),
-      cancel,
+      cancel: () =>
+        terminate({ code: Status.CANCELLED, details: "cancelled", metadata: new Metadata() }),
     };
   }
 
@@ -223,7 +431,6 @@ class Conn {
     }
   }
 
-  /** Handle an inbound JSON text frame (the `+json` codec). */
   private onJsonFrame(text: string): void {
     let jf: any;
     try {
@@ -233,17 +440,14 @@ class Conn {
     }
     const streamId: number = jf.streamId;
     if (jf.status) {
-      // Terminal: trailer / reset.
       this.deliverStatus(streamId, {
         code: jf.status.code as Status,
         details: jf.status.message ?? "",
         metadata: jsonToMeta(jf.metadata),
       });
     } else if (jf.message !== undefined) {
-      // Re-serialize the native JSON message to bytes for the deserializer.
       this.streams.get(streamId)?.onMessage?.(this.enc.encode(JSON.stringify(jf.message)));
     } else if (jf.metadata) {
-      // Initial response metadata (header).
       this.streams.get(streamId)?.onHeaders?.(jsonToMeta(jf.metadata));
     }
   }
@@ -255,7 +459,6 @@ class Conn {
   }
 
   private onClose(): void {
-    // Fail any still-open streams.
     const status: StatusResult = {
       code: Status.UNAVAILABLE,
       details: "websocket closed",
@@ -269,10 +472,35 @@ class Conn {
   }
 }
 
+/** Map an http(s) base URL to its ws(s) form (base path). */
 function toWsUrl(baseUrl: string): string {
   const url = new URL(baseUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+/** Build the ws(s) URL for a method path (single-stream mode). */
+function methodWsUrl(baseUrl: string, path: string): string {
+  const url = new URL(path, baseUrl);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
+}
+
+/** RFC 7230 token characters — a WebSocket subprotocol must be a valid token. */
+const SUBPROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Derive the connection-level WebSocket credential from a call's `authorization`
+ * metadata: strip a `Bearer ` scheme and, if the remaining token is a valid
+ * subprotocol token (JWTs and typical API keys are), offer it as `bearer.<token>`.
+ * Non-token-safe credentials aren't sent this way — the full metadata still rides
+ * in the open frame for per-stream authorization.
+ */
+function bearerSubprotocol(metadata: Metadata): string | undefined {
+  const value = metadata.get("authorization")[0];
+  if (typeof value !== "string") return undefined;
+  const token = value.replace(/^Bearer\s+/i, "");
+  return SUBPROTOCOL_TOKEN.test(token) ? `bearer.${token}` : undefined;
 }
 
 /** Metadata -> JSON object (ASCII values only) for a JSON frame. */

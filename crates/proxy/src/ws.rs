@@ -32,8 +32,18 @@ struct StreamState {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Serve one upgraded WebSocket connection.
-pub async fn serve(channel: Channel, websocket: HyperWebsocket, max_streams: usize) {
+/// Serve one upgraded WebSocket connection. `multi` = multiplexed (streams carry
+/// `stream_id`/`method`); otherwise single-stream, with the method taken from
+/// `method` (the WS URL path) and the one stream normalized to id 1.
+pub async fn serve(
+    channel: Channel,
+    websocket: HyperWebsocket,
+    max_streams: usize,
+    multi: bool,
+    method: Option<String>,
+) {
+    let method_url = method.unwrap_or_default();
+    let mut opened = false;
     let ws = match websocket.await {
         Ok(ws) => ws,
         Err(e) => {
@@ -81,6 +91,7 @@ pub async fn serve(channel: Channel, websocket: HyperWebsocket, max_streams: usi
                             Ok(f) => f,
                             Err(e) => { tracing::debug!("bad frame: {e}"); continue; }
                         };
+                        let Some(frame) = normalize(frame, multi, &method_url, &mut opened) else { continue };
                         handle_frame(frame, &channel, &outbound_tx, &done_tx, &mut streams, max_streams).await;
                     }
                     TungMessage::Close(_) => break,
@@ -97,6 +108,27 @@ pub async fn serve(channel: Channel, websocket: HyperWebsocket, max_streams: usi
     }
     drop(outbound_tx);
     let _ = writer.await;
+}
+
+/// In single-stream mode, take the method from the URL, normalize the stream to id
+/// 1, and require a `Subscribe` to open. In multiplexed mode, pass frames through.
+fn normalize(mut frame: Frame, multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+    if multi {
+        return Some(frame);
+    }
+    match frame.kind.as_mut()? {
+        Kind::Subscribe(s) => {
+            s.stream_id = 1;
+            s.method = method_url.to_string();
+            *opened = true;
+        }
+        _ if !*opened => return None, // must open with a Subscribe first
+        Kind::Message(m) => m.stream_id = 1,
+        Kind::HalfClose(h) => h.stream_id = 1,
+        Kind::Reset(r) => r.stream_id = 1,
+        _ => {}
+    }
+    Some(frame)
 }
 
 async fn handle_frame(
