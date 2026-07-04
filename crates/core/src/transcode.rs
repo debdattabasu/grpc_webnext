@@ -92,6 +92,13 @@ impl Transcoder {
         Ok((m.input(), m.output()))
     }
 
+    /// Whether `path` (`/pkg.Service/Method`) resolves to a known method — i.e. this
+    /// transcoder can handle it. Callers use it to distinguish "unknown method"
+    /// (UNIMPLEMENTED) from a genuine transcode/validation failure.
+    pub fn has_method(&self, path: &str) -> bool {
+        self.io_types(path).is_ok()
+    }
+
     /// JSON request message -> binary protobuf. Empty input is the default message.
     pub fn request_json_to_proto(&self, path: &str, json: &[u8]) -> Result<Vec<u8>, TranscodeError> {
         let (input, _) = self.io_types(path)?;

@@ -11,8 +11,13 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use grpc_webnext_core::json_frame::{
+    decode_json_frame, encode_json_frame, json_frame_to_proto, json_open_to_subscribe,
+    proto_frame_to_json,
+};
 use grpc_webnext_core::pb::{frame::Kind, Frame, Header, Message as WsMessage, Reset, Trailer};
-use grpc_webnext_core::{decode_frame, encode_frame, BytesCodec};
+use grpc_webnext_core::{decode_frame, encode_frame, BytesCodec, WsBinding};
+use std::sync::Arc;
 use hyper_tungstenite::tungstenite::Message as TungMessage;
 use hyper_tungstenite::HyperWebsocket;
 use http::uri::PathAndQuery;
@@ -22,6 +27,7 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::metadata;
+use crate::Schema;
 
 /// Per-stream state held by the connection's read loop.
 struct StreamState {
@@ -34,12 +40,18 @@ struct StreamState {
 
 /// Serve one upgraded WebSocket connection. `multi` = multiplexed (streams carry
 /// `stream_id`/`method`); otherwise single-stream, with the method taken from
-/// `method` (the WS URL path) and the one stream normalized to id 1.
+/// `method` (the WS URL path) and the one stream normalized to id 1. `json` selects
+/// the codec (text/JSON vs binary/proto) up front from the negotiated subprotocol;
+/// JSON streams transcode each message via `schema`.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     channel: Channel,
+    schema: Schema,
+    annotation: Option<Arc<WsBinding>>,
     websocket: HyperWebsocket,
     max_streams: usize,
     multi: bool,
+    json: bool,
     method: Option<String>,
     keepalive: Option<std::time::Duration>,
     keepalive_timeout: std::time::Duration,
@@ -73,11 +85,7 @@ pub async fn serve(
             tokio::select! {
                 frame = outbound_rx.recv() => {
                     let Some(frame) = frame else { break };
-                    if ws_sink
-                        .send(TungMessage::Binary(encode_frame(&frame)))
-                        .await
-                        .is_err()
-                    {
+                    if ws_sink.send(to_tung(&frame, json, multi)).await.is_err() {
                         break;
                     }
                 }
@@ -115,20 +123,18 @@ pub async fn serve(
                 if let Some(d) = max_silence {
                     deadline = Some(tokio::time::Instant::now() + d);
                 }
-                match msg {
-                    TungMessage::Binary(data) => {
-                        let frame = match decode_frame(&data) {
-                            Ok(f) => f,
-                            Err(e) => { tracing::debug!("bad frame: {e}"); continue; }
-                        };
-                        let Some(frame) = normalize(frame, multi, &method_url, &mut opened) else { continue };
-                        handle_frame(frame, &channel, &outbound_tx, &done_tx, &mut streams, max_streams).await;
-                    }
+                let frame = match msg {
+                    // The codec is pinned by the subprotocol, so a frame of the wrong
+                    // kind (binary on a JSON socket or vice versa) is simply ignored.
+                    TungMessage::Binary(data) if !json => decode_binary(&data, multi, &method_url, &mut opened),
+                    TungMessage::Text(text) if json => decode_text(&text, multi, &method_url, &mut opened),
                     TungMessage::Close(_) => break,
                     // Pong (the peer's reply to our keepalive ping) needs no action;
-                    // an inbound Ping is auto-answered by tungstenite. Text is unused.
-                    _ => {}
-                }
+                    // an inbound Ping is auto-answered by tungstenite.
+                    _ => continue,
+                };
+                let Some(frame) = frame else { continue };
+                handle_frame(frame, json, &channel, &schema, &annotation, &outbound_tx, &done_tx, &mut streams, max_streams).await;
             }
         }
     }
@@ -141,9 +147,11 @@ pub async fn serve(
     let _ = writer.await;
 }
 
-/// In single-stream mode, take the method from the URL, normalize the stream to id
-/// 1, and require a `Subscribe` to open. In multiplexed mode, pass frames through.
-fn normalize(mut frame: Frame, multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+/// Decode an inbound binary (proto) frame. In single-stream mode take the method from
+/// the URL, normalize the stream to id 1, and require a `Subscribe` to open; in
+/// multiplexed mode pass frames through.
+fn decode_binary(data: &[u8], multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+    let mut frame = decode_frame(data).ok()?;
     if multi {
         return Some(frame);
     }
@@ -162,9 +170,42 @@ fn normalize(mut frame: Frame, multi: bool, method_url: &str, opened: &mut bool)
     Some(frame)
 }
 
+/// Decode an inbound text (JSON) frame into an internal `Frame` whose message payload
+/// is still JSON bytes (transcoded to protobuf per-message in `run_stream`). In
+/// single-stream mode the first frame opens the one stream with the URL's method.
+fn decode_text(text: &str, multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+    let jf = decode_json_frame(text).ok()?;
+    if multi {
+        return Some(json_frame_to_proto(jf, 0));
+    }
+    if !*opened {
+        *opened = true;
+        let sub = json_open_to_subscribe(jf, method_url.to_string(), 1);
+        Some(Frame { kind: Some(Kind::Subscribe(sub)) })
+    } else {
+        Some(json_frame_to_proto(jf, 1))
+    }
+}
+
+/// Encode an outbound internal `Frame` as a WebSocket message in the stream's codec:
+/// a JSON text frame when `json` (frames with no JSON form fall back to binary),
+/// otherwise a binary proto frame. `multi` controls whether JSON frames carry `streamId`.
+fn to_tung(frame: &Frame, json: bool, multi: bool) -> TungMessage {
+    if json {
+        if let Some(jf) = proto_frame_to_json(frame, multi) {
+            return TungMessage::Text(encode_json_frame(&jf).into());
+        }
+    }
+    TungMessage::Binary(encode_frame(frame))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     frame: Frame,
+    json: bool,
     channel: &Channel,
+    schema: &Schema,
+    annotation: &Option<Arc<WsBinding>>,
     outbound_tx: &mpsc::Sender<Frame>,
     done_tx: &mpsc::Sender<u32>,
     streams: &mut HashMap<u32, StreamState>,
@@ -195,11 +236,24 @@ async fn handle_frame(
                 let _ = req_tx.send(sub.initial_payload).await;
             }
 
+            // A REST annotation route with no body (GET-style server-stream) takes its one
+            // request entirely from the URL: inject an empty payload (the binding fills it
+            // from path/query) and half-close.
+            let req_tx_state = if annotation.as_ref().is_some_and(|a| !a.has_body()) {
+                let _ = req_tx.send(Bytes::new()).await;
+                None
+            } else {
+                Some(req_tx)
+            };
+
             let metadata = metadata::metadata_vec_to_metadata(&sub.headers);
             let timeout = metadata::grpc_timeout_from_metadatum(&sub.timeout_millis);
 
             let task = tokio::spawn(run_stream(
                 channel.clone(),
+                schema.clone(),
+                json,
+                annotation.clone(),
                 path,
                 metadata,
                 timeout,
@@ -209,7 +263,7 @@ async fn handle_frame(
                 done_tx.clone(),
             ));
 
-            streams.insert(stream_id, StreamState { req_tx: Some(req_tx), task });
+            streams.insert(stream_id, StreamState { req_tx: req_tx_state, task });
         }
         Some(Kind::Message(msg)) => {
             if let Some(state) = streams.get(&msg.stream_id) {
@@ -236,8 +290,12 @@ async fn handle_frame(
 
 /// Drive one upstream gRPC stream: forward request messages, pump responses
 /// back as frames, and finish with a `Trailer`.
+#[allow(clippy::too_many_arguments)]
 async fn run_stream(
     channel: Channel,
+    schema: Schema,
+    json: bool,
+    annotation: Option<Arc<WsBinding>>,
     path: PathAndQuery,
     metadata: tonic::metadata::MetadataMap,
     timeout: Option<std::time::Duration>,
@@ -246,7 +304,40 @@ async fn run_stream(
     outbound_tx: mpsc::Sender<Frame>,
     done_tx: mpsc::Sender<u32>,
 ) {
-    let request_stream = ReceiverStream::new(req_rx);
+    let method_path = path.path().to_string();
+
+    // Resolve the transcoder for this method up front (JSON only). A first hit for a
+    // service may do a reflection round-trip, but it runs in this per-stream task, so it
+    // never blocks the connection read loop or other multiplexed streams.
+    let transcoder = if json {
+        match schema.transcoder(&method_path).await {
+            Ok(tc) => Some(tc),
+            Err(status) => {
+                send_trailer(&outbound_tx, stream_id, &status).await;
+                let _ = done_tx.send(stream_id).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Request messages become protobuf: a REST annotation builds each from the URL +
+    // body; a plain `+json` stream transcodes each JSON message; proto passes through.
+    // The `BytesCodec` frames each one on the wire.
+    let req_tc = transcoder.clone();
+    let req_ann = annotation.clone();
+    let req_path = method_path.clone();
+    let request_stream = ReceiverStream::new(req_rx).map(move |payload| {
+        // A transcode failure yields empty bytes, which the upstream rejects.
+        if let Some(ann) = &req_ann {
+            ann.build_message(&payload).map(Bytes::from).unwrap_or_default()
+        } else if let Some(tc) = &req_tc {
+            tc.request_json_to_proto(&req_path, &payload).map(Bytes::from).unwrap_or_default()
+        } else {
+            payload
+        }
+    });
     let mut request = tonic::Request::from_parts(metadata, Default::default(), request_stream);
     if let Some(d) = timeout {
         request.set_timeout(d + crate::DEADLINE_GRACE); // forwarded as a backstop
@@ -278,7 +369,18 @@ async fn run_stream(
         loop {
             match stream.message().await {
                 Ok(Some(payload)) => {
-                    // `payload` is `Bytes` from the upstream codec — forwarded without copying.
+                    // Proto response message: transcoded to JSON when `json`, otherwise
+                    // forwarded as `Bytes` without copying.
+                    let payload = match &transcoder {
+                        Some(tc) => match tc.response_proto_to_json(&method_path, &payload) {
+                            Ok(j) => Bytes::from(j),
+                            Err(e) => {
+                                send_reset(&outbound_tx, stream_id, Code::Internal, &format!("json encode: {e}")).await;
+                                break;
+                            }
+                        },
+                        None => payload,
+                    };
                     let frame = Frame {
                         kind: Some(Kind::Message(WsMessage { stream_id, payload })),
                     };

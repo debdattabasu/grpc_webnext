@@ -6,27 +6,50 @@ transcoding, and the auth handshake all match the code, with solid coverage on t
 happy paths. Three real behavioral drifts, one internal doc contradiction, and a
 cluster of test gaps concentrated in the httprule subset and the proxy's JSON
 handling. Drift 2 (client close-code reconstruction) and drift 3 (keepalive) are
-fixed as of 2026-07-04; drift 1 remains open.
+fixed as of 2026-07-04. Drift 1 is resolved as of 2026-07-05 — but by *implementing*
+proxy `+json` (transcoding), not by rejecting it, so PROTOCOL.md's "the v1 proxy
+rejects `+json`" claim is now the stale side and needs updating.
 
 ## Drift: doc says X, code does Y
 
-### 1. The proxy does not reject `+json` on WebSocket
+### 1. The proxy did not handle `+json` correctly — RESOLVED (2026-07-05)
 
-PROTOCOL.md says the v1 proxy "rejects `+json` with `UNIMPLEMENTED`". Split by
-transport:
+PROTOCOL.md said the v1 proxy "rejects `+json` with `UNIMPLEMENTED`". The original
+finding: Fetch returned an HTTP `501` plain-text body (not a gRPC trailer), and
+WebSocket didn't reject at all — it echoed `grpc-webnext+json`/`+json+multi` back,
+negotiated the connection, then forwarded JSON payloads opaquely to an upstream that
+expects binary protobuf, so the client got garbage errors instead of a clean close.
 
-- **Fetch:** the rejection exists but is an HTTP `501` with a plain-text body
-  (`crates/proxy/src/lib.rs:181-185`), not a gRPC `UNIMPLEMENTED` trailer.
-- **WebSocket:** no rejection at all. The upgrade handler recognizes and echoes
-  back `grpc-webnext+json` and `+json+multi` (`crates/proxy/src/lib.rs:144-161`)
-  — the WS way of saying "yes, I speak this" — then forwards JSON payloads
-  opaquely to an upstream `application/grpc` server that expects binary protobuf.
+Resolved by making the proxy **terminate `+json`** rather than reject it. When a
+descriptor source is configured (`ProxyConfig::schema`), the proxy transcodes the
+JSON request to the upstream's binary protobuf and the binary response back to JSON,
+on both Fetch and WebSocket, reusing the same core `Transcoder` as the native server
+(so a client can't tell the two apart). Descriptors come from **upstream gRPC
+reflection** (v1 with a v1alpha fallback), a **bundled `FileDescriptorSet`**, or **both**
+(`SchemaSource::{Reflection, Bundled, ReflectionOrBundled}` — the last is reflection with
+the bundle as an immediate fallback). With no source (`SchemaSource::None`, the default)
+`+json` returns a gRPC `UNIMPLEMENTED` status — now a proper status-in-header response on
+both surfaces, not an HTTP 501.
 
-The failure is deferred and misattributed: instead of a clean `4012` close at
-handshake, the client gets a negotiated connection followed by garbage errors
-from the upstream. No test covers proxy WS `+json`. Fix: treat the two `+json`
-subprotocol variants like the native server treats unsupported codecs — accept
-the upgrade, close `4012`.
+- Binary `+proto` is untouched: still schema-agnostic, still streamed opaquely.
+- Reflection is loaded **eagerly and whole** (2026-07-05): on startup the proxy
+  `list_services` + fetches every service's transitive closure into one snapshot,
+  refreshed on a TTL (`ProxyConfig::reflection_ttl`, default 4h). An optional
+  management endpoint (`admin_reload_path`, `POST`) forces an immediate reload;
+  `Schema::reload()` exposes the same programmatically. Requests block (bounded) only
+  for the first load. See `crates/proxy/src/reflect.rs` / `schema.rs`.
+- Unknown methods surface as `UNIMPLEMENTED` uniformly (`Transcoder::has_method`).
+- Covered by `crates/proxy/tests/json.rs` (bundled + reflection × Fetch + WS, plus
+  no-schema, unknown-method, and admin-reload cases).
+
+REST / `google.api.http` annotation routing also works on the proxy (2026-07-05), on
+both Fetch (`handle_json_fetch` tries a REST binding before the main method path) and
+WebSocket (`match_ws` at upgrade). Caveat: REST over reflection needs the upstream's
+reflection to preserve custom options — the proxy frames raw descriptor bytes so options
+survive, but tonic-reflection strips `google.api.http` (Go/Java/C++ don't); bundled
+descriptors always carry them. See BACKLOG.md.
+
+Follow-up: update PROTOCOL.md — the "v1 proxy rejects `+json`" line is now stale.
 
 ### 2. The client never reconstructs a `Status` from the close frame — RESOLVED (2026-07-04)
 
@@ -208,9 +231,9 @@ annotated URLs. The REST-section sentence is stale.
 - **`+json+multi` on annotated WS routes**: the guard is `proto || multi` but
   only the `proto` half has a test (`json.rs:489`); the `multi` half could be
   dropped without a test failing.
-- **Proxy negative paths**: WS `+json` (drift 1 — the current forwarding
-  behavior is also unpinned), the 415 unknown-content-type branch, the 413
-  size limit, duplicate-stream_id reset.
+- **Proxy negative paths**: the 415 unknown-content-type branch, the 413
+  size limit, duplicate-stream_id reset. (Proxy `+json`, formerly drift 1, is now
+  covered end-to-end by `crates/proxy/tests/json.rs`.)
 - **Client-side limits and errors**: `maxMessageBytes` overflow (Rust core
   limit is tested, TS client's isn't), the `FetchTransport.startStream` throw,
   `poolSize > 1` round-robin distribution, `grpc-timeout` header emission on

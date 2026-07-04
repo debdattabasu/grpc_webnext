@@ -95,7 +95,10 @@ async fn upstream_error_is_trailers_only() {
 }
 
 #[tokio::test]
-async fn rejects_json_content_type() {
+async fn json_without_schema_is_unimplemented() {
+    // With no descriptor source the proxy is binary-only: +json yields a gRPC
+    // UNIMPLEMENTED status (HTTP 200, status in the header). See tests/json.rs for the
+    // reflection/bundled transcoding paths.
     let base = setup().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -105,5 +108,9 @@ async fn rejects_json_content_type() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 501); // NOT_IMPLEMENTED
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("grpc-status").unwrap(),
+        &(tonic::Code::Unimplemented as u32).to_string()
+    );
 }

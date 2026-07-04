@@ -17,17 +17,23 @@ hyper = { version = "1.10.1", features = ["server", "http1", "http2"] }
 hyper-tungstenite = "0.20.0"
 hyper-util = { version = "0.1.20", features = ["full"] }
 prost = "0.14.4"
+prost-types = "0.14.4"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = "0.1.18"
 tonic = "0.14.6"
+tonic-prost = "0.14.6"
 tower = "0.5.3"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 futures = "0.3.32"
 grpc-webnext-core = { path = "../core" }
 prost = "0.14.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2"] }
+serde_json = "1"
 testecho = { path = "../testecho" }
 tokio-tungstenite = "0.29.0"

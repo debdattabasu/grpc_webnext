@@ -5,9 +5,15 @@
 //!   * grpc-webnext unary over Fetch — translated into a native gRPC call,
 //!   * grpc-webnext streaming over WebSocket — translated per stream.
 //!
-//! Binary-only for grpc-webnext (`+json` -> UNIMPLEMENTED). Deadlines are
-//! enforced locally (the upstream call is dropped on expiry) *and* forwarded
-//! downstream as `grpc-timeout`; client cancellation (Reset / disconnect)
+//! Binary `+proto` is schema-agnostic: message bytes are forwarded opaquely, streamed
+//! without buffering. `+json` is transcoded to/from the upstream's binary protobuf
+//! when a descriptor source is configured (upstream reflection or a bundled
+//! `FileDescriptorSet`, see [`SchemaSource`]); with no source it stays `UNIMPLEMENTED`.
+//! Because both surfaces reuse the same core transcoder as the native library, a client
+//! can't tell a proxied `+json` response from a native one.
+//!
+//! Deadlines are enforced locally (the upstream call is dropped on expiry) *and*
+//! forwarded downstream as `grpc-timeout`; client cancellation (Reset / disconnect)
 //! propagates to the upstream by dropping the call.
 
 use std::convert::Infallible;
@@ -17,8 +23,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use grpc_webnext_core::pb::Trailer;
 use grpc_webnext_core::{
-    encode_response_body, encode_trailer_block, EMPTY_MESSAGE_BLOCK, LEN_PREFIX,
+    deframe_all, encode_response_body, encode_trailer_block, grpc_frame, Transcoder,
+    EMPTY_MESSAGE_BLOCK, LEN_PREFIX,
 };
+use http::uri::PathAndQuery;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -32,7 +40,11 @@ use tonic::Code;
 use tower::ServiceExt;
 
 pub mod metadata;
+mod reflect;
+mod schema;
 pub mod ws;
+
+pub use schema::{Schema, SchemaSource};
 
 pub const CT_PROTO: &str = "application/grpc-webnext+proto";
 pub const CT_JSON: &str = "application/grpc-webnext+json";
@@ -65,6 +77,25 @@ pub struct ProxyConfig {
     /// analogue. Only applies when `ws_keepalive` is set. Defaults to 20s (gRPC's
     /// default); a peer silent for `ws_keepalive + ws_keepalive_timeout` is dropped.
     pub ws_keepalive_timeout: Duration,
+    /// Descriptor source for `+json` termination. `None` (the default) keeps the proxy
+    /// binary-only (`+json` -> UNIMPLEMENTED); `Reflection` transcodes using descriptors
+    /// fetched from the upstream's reflection service; `Bundled` uses a supplied
+    /// `FileDescriptorSet`. The binary `+proto` path is unaffected either way.
+    pub schema: SchemaSource,
+    /// How often to refresh the reflection descriptor snapshot (only for
+    /// `SchemaSource::Reflection`). Defaults to 4h. A forced reload via
+    /// `admin_reload_path` is independent of this interval.
+    pub reflection_ttl: Duration,
+    /// Optional management endpoint that forces an immediate reflection reload. When
+    /// `Some(path)`, a `POST` to that exact path reloads and returns 200/503; all other
+    /// methods on it return 405. `None` (the default) disables it. Restrict network
+    /// access to this path — it is unauthenticated.
+    pub admin_reload_path: Option<String>,
+    /// Accept plain `application/json` (or a blank content-type) on a *main* gRPC method
+    /// path — i.e. treat it as `+json`. Off by default: plain JSON is then only accepted
+    /// on REST-annotated URLs, and a main path requires `application/grpc-webnext+json`.
+    /// REST annotation routes work regardless of this flag.
+    pub allow_implicit_codec: bool,
 }
 
 impl Default for ProxyConfig {
@@ -75,6 +106,10 @@ impl Default for ProxyConfig {
             max_concurrent_streams: 100,
             ws_keepalive: None,
             ws_keepalive_timeout: Duration::from_secs(20),
+            schema: SchemaSource::None,
+            reflection_ttl: Duration::from_secs(4 * 60 * 60),
+            admin_reload_path: None,
+            allow_implicit_codec: false,
         }
     }
 }
@@ -89,13 +124,19 @@ impl Default for ProxyConfig {
 struct Proxy {
     config: ProxyConfig,
     channel: Channel,
+    schema: Schema,
 }
 
 /// Serve the proxy on `listener` until the process ends.
 pub async fn serve(listener: TcpListener, config: ProxyConfig) -> std::io::Result<()> {
     // Lazy connect: the upstream need not be up when the proxy starts.
     let channel = Channel::builder(config.upstream.clone()).connect_lazy();
-    let proxy = Proxy { config, channel };
+    // A bad bundled descriptor set is a config error — surface it at startup.
+    let schema = Schema::build(config.schema.clone(), channel.clone(), config.reflection_ttl)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    // Kick off the eager reflection load + TTL refresh (no-op for None/Bundled).
+    schema.start();
+    let proxy = Proxy { config, channel, schema };
 
     loop {
         let (stream, _peer) = listener.accept().await?;
@@ -119,6 +160,14 @@ pub async fn serve(listener: TcpListener, config: ProxyConfig) -> std::io::Resul
 
 impl Proxy {
     async fn handle(&self, mut req: Request<Incoming>) -> Result<Response<ResBody>, Infallible> {
+        // Management endpoint: force a reflection reload. Matched before all routing so
+        // it can't collide with a gRPC method path.
+        if let Some(admin) = &self.config.admin_reload_path {
+            if req.uri().path() == admin {
+                return Ok(self.handle_admin_reload(req.method()).await);
+            }
+        }
+
         // WebSocket streaming path: hijack the connection and serve frames.
         if hyper_tungstenite::is_upgrade_request(&req) {
             // Parse the offered subprotocols. The proxy is proto-only; it just needs
@@ -131,19 +180,39 @@ impl Proxy {
                 .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
                 .unwrap_or_default();
             let has = |s: &str| subs.iter().any(|p| p == s);
-            let multi = has("grpc-webnext+proto+multi") || has("grpc-webnext+json+multi");
-            // Echo whichever recognized subprotocol was offered.
+            let mut multi = has("grpc-webnext+proto+multi") || has("grpc-webnext+json+multi");
+            let mut json = has("grpc-webnext+json+multi") || has("grpc-webnext+json");
+            // Echo whichever recognized subprotocol was offered (REST clients may offer
+            // `application/json`).
             let echo = [
                 "grpc-webnext+proto+multi",
                 "grpc-webnext+json+multi",
                 "grpc-webnext+proto",
                 "grpc-webnext+json",
                 "grpc-webnext",
+                "application/json",
             ]
             .into_iter()
             .find(|&p| has(p));
             // Single-stream: the method is the URL path; multiplexed: from each Subscribe.
-            let method = (!multi).then(|| req.uri().path().to_string());
+            let mut method = (!multi).then(|| req.uri().path().to_string());
+
+            // REST annotation? A matching WS URL binds to a gRPC method; the route is
+            // single-stream JSON, method from the binding, requests built from the URL.
+            let annotation = if self.schema.enabled() {
+                match self.schema.transcoder_any().await {
+                    Ok(tc) => tc.match_ws(req.uri().path(), req.uri().query()).map(std::sync::Arc::new),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            if let Some(ann) = &annotation {
+                multi = false;
+                json = true;
+                method = Some(ann.grpc_method().to_string());
+            }
+
             return Ok(match hyper_tungstenite::upgrade(&mut req, None) {
                 Ok((mut response, websocket)) => {
                     if let Some(p) = echo {
@@ -153,11 +222,12 @@ impl Proxy {
                         );
                     }
                     let channel = self.channel.clone();
+                    let schema = self.schema.clone();
                     let max_streams = self.config.max_concurrent_streams;
                     let keepalive = self.config.ws_keepalive;
                     let keepalive_timeout = self.config.ws_keepalive_timeout;
                     tokio::spawn(async move {
-                        ws::serve(channel, websocket, max_streams, multi, method, keepalive, keepalive_timeout).await
+                        ws::serve(channel, schema, annotation, websocket, max_streams, multi, json, method, keepalive, keepalive_timeout).await
                     });
                     response.map(boxed_full)
                 }
@@ -175,19 +245,43 @@ impl Proxy {
         Ok(if content_type == CT_PROTO {
             self.handle_unary(req).await
         } else if content_type == CT_JSON {
-            text_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "proxy is binary-only; +json is served by the native library",
-            )
+            // SDK `+json`: try a REST annotation binding first, then the main method path.
+            self.handle_json_fetch(req, true).await
         } else if content_type.starts_with(CT_GRPC) {
             // Native gRPC: forward to the upstream untouched (same-port passthrough).
             self.passthrough(req).await
+        } else if (content_type == "application/json" || content_type.is_empty())
+            && self.schema.enabled()
+        {
+            // Plain REST/JSON: only meaningful with a schema. REST-annotated URLs are
+            // transcoded; a main path needs `allow_implicit_codec`.
+            self.handle_json_fetch(req, false).await
         } else {
             text_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "expected application/grpc-webnext+proto or application/grpc",
             )
         })
+    }
+
+    /// Force an immediate reflection reload (management hook). `POST` only.
+    async fn handle_admin_reload(&self, method: &http::Method) -> Response<ResBody> {
+        if method != http::Method::POST {
+            return text_response(StatusCode::METHOD_NOT_ALLOWED, "use POST to force a reflection reload");
+        }
+        match self.schema.reload().await {
+            Ok(()) => text_response(StatusCode::OK, "reflection reloaded"),
+            Err(status) => {
+                // Nothing-to-reload (None/Bundled) is a client mistake; a failed fetch is
+                // an upstream problem.
+                let http = if status.code() == Code::FailedPrecondition {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                text_response(http, format!("reflection reload failed: {}", status.message()))
+            }
+        }
     }
 
     /// Forward a native gRPC request to the upstream unchanged. The channel's
@@ -323,6 +417,179 @@ impl Proxy {
 
         out.body(StreamBody::new(stream).boxed_unsync()).expect("valid response")
     }
+
+    /// Unary over Fetch with the `+json` codec, including REST annotation routing. A
+    /// `google.api.http` binding is tried first (the URL is a REST pattern; its
+    /// path/query/body build the request message); otherwise the URL is the gRPC method
+    /// path — `sdk_json` (the `+json` contract) is always allowed there, while plain JSON
+    /// needs `allow_implicit_codec`. Either way JSON<->proto is transcoded around a binary
+    /// upstream call, with the native library's response shape.
+    async fn handle_json_fetch(&self, req: Request<Incoming>, sdk_json: bool) -> Response<ResBody> {
+        let tc = match self.schema.transcoder_any().await {
+            Ok(tc) => tc,
+            Err(s) => return json_error(s.code(), s.message()),
+        };
+        let http_method = req.method().clone();
+        let Some(pq) = req.uri().path_and_query().cloned() else {
+            return json_error(Code::Internal, "missing request path");
+        };
+        let deadline = metadata::parse_grpc_timeout(req.headers());
+        let (parts, body) = req.into_parts();
+        let body_bytes = match collect_bounded(body, self.config.max_message_bytes).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+
+        // 1) REST annotation binding? Path/query/body build the method's request message.
+        match tc.transcode_http_request(http_method.as_str(), pq.path(), pq.query(), &body_bytes) {
+            Ok(Some(call)) => {
+                let Ok(grpc_path) = call.grpc_method.parse::<PathAndQuery>() else {
+                    return json_error(Code::Internal, "bad transcoded method path");
+                };
+                return self
+                    .unary_json_upstream(&tc, grpc_path, call.message.into(), &parts.headers, deadline)
+                    .await;
+            }
+            Ok(None) => {} // not a REST URL — fall through to the main method path
+            Err(e) => return json_error(Code::InvalidArgument, &format!("bad REST request: {e}")),
+        }
+
+        // 2) Main gRPC method path (the URL is `/pkg.Service/Method`).
+        if !sdk_json && !self.config.allow_implicit_codec {
+            return json_error(
+                Code::Unimplemented,
+                "this path requires content-type application/grpc-webnext+json (or set allow_implicit_codec)",
+            );
+        }
+        if !tc.has_method(pq.path()) {
+            return json_error(Code::Unimplemented, &format!("no descriptor for method {}", pq.path()));
+        }
+        let proto = match tc.request_json_to_proto(pq.path(), &body_bytes) {
+            Ok(p) => p,
+            Err(e) => return json_error(Code::InvalidArgument, &format!("bad json request: {e}")),
+        };
+        self.unary_json_upstream(&tc, pq, proto.into(), &parts.headers, deadline).await
+    }
+
+    /// Call the upstream with an already-encoded binary request message and render the
+    /// binary response as native JSON (bare body, status in `grpc-status`/`grpc-message`
+    /// headers). Shared by the SDK `+json` and REST annotation paths. JSON necessarily
+    /// buffers both messages (the transform is whole-message); the request was bounded by
+    /// `max_message_bytes` upstream of here.
+    async fn unary_json_upstream(
+        &self,
+        tc: &Transcoder,
+        grpc_path: PathAndQuery,
+        message: Bytes,
+        req_headers: &HeaderMap,
+        deadline: Option<Duration>,
+    ) -> Response<ResBody> {
+        let mut builder = Request::builder().method(http::Method::POST).uri(grpc_path.clone());
+        for (name, value) in req_headers.iter() {
+            if !metadata::is_denied(name) {
+                builder = builder.header(name.clone(), value.clone());
+            }
+        }
+        builder = builder.header(http::header::CONTENT_TYPE, CT_GRPC).header("te", "trailers");
+        if let Some(d) = deadline {
+            builder = builder.header("grpc-timeout", metadata::format_grpc_timeout(d + DEADLINE_GRACE));
+        }
+        let grpc_req =
+            builder.body(TonicBody::new(Full::new(grpc_frame(&message)))).expect("valid request");
+
+        // Establish + collect under the local deadline (dropping the future cancels the
+        // upstream RPC). JSON must buffer the response to transcode it anyway.
+        let channel = self.channel.clone();
+        let call = async move {
+            let resp = channel.oneshot(grpc_req).await.map_err(|e| format!("upstream: {e}"))?;
+            let (parts, body) = resp.into_parts();
+            let collected = body.collect().await.map_err(|e| format!("upstream body: {e}"))?;
+            Ok::<_, String>((parts, collected))
+        };
+        let (resp_parts, collected) = match deadline {
+            Some(d) => match tokio::time::timeout(d, call).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return json_error(Code::Unavailable, &e),
+                Err(_) => return json_error(Code::DeadlineExceeded, "proxy deadline exceeded"),
+            },
+            None => match call.await {
+                Ok(v) => v,
+                Err(e) => return json_error(Code::Unavailable, &e),
+            },
+        };
+
+        let trailer_headers = collected.trailers().cloned().unwrap_or_default();
+        let body_bytes = collected.to_bytes();
+        let out_message = deframe_all(&body_bytes).into_iter().next().unwrap_or_default();
+        let (status_code, status_message) =
+            metadata::read_status(&trailer_headers, &resp_parts.headers);
+
+        let json_body = if status_code == 0 && !out_message.is_empty() {
+            match tc.response_proto_to_json(grpc_path.path(), &out_message) {
+                Ok(j) => Bytes::from(j),
+                Err(e) => return json_error(Code::Internal, &format!("bad json response: {e}")),
+            }
+        } else {
+            Bytes::new()
+        };
+        json_fetch_response(
+            json_body,
+            status_code,
+            &status_message,
+            &resp_parts.headers,
+            &trailer_headers,
+        )
+    }
+}
+
+/// Buffer a request body into memory, bounded by `max`. Used by the `+json` path,
+/// which must hold the whole message to transcode it (binary `+proto` streams instead).
+async fn collect_bounded(mut body: Incoming, max: usize) -> Result<Bytes, Response<ResBody>> {
+    let mut buf = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| json_error(Code::Internal, &format!("read body: {e}")))?;
+        if let Ok(data) = frame.into_data() {
+            if buf.len() + data.len() > max {
+                return Err(json_error(Code::ResourceExhausted, "request message exceeds size limit"));
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Ok(buf.freeze())
+}
+
+/// Render a native-JSON Fetch response: bare JSON message body (empty on error) with
+/// the status in `grpc-status`/`grpc-message` and metadata in headers. Mirrors the
+/// native server's `json_fetch_response` so the two surfaces are indistinguishable.
+fn json_fetch_response(
+    message: Bytes,
+    status_code: u32,
+    status_message: &str,
+    initial: &HeaderMap,
+    trailing: &HeaderMap,
+) -> Response<ResBody> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, CT_JSON)
+        .header("grpc-status", status_code.to_string());
+    if !status_message.is_empty() {
+        if let Ok(v) = http::HeaderValue::from_str(&metadata::percent_encode(status_message)) {
+            builder = builder.header("grpc-message", v);
+        }
+    }
+    if let Some(headers) = builder.headers_mut() {
+        let md = |h: &HeaderMap| MetadataMap::from_headers(h.clone());
+        metadata::merge_metadata_into_headers(&md(initial), headers);
+        metadata::merge_metadata_into_headers(&md(trailing), headers);
+    }
+    // On error there is no message body.
+    let body = if status_code == 0 { message } else { Bytes::new() };
+    builder.body(boxed_full(Full::new(body))).expect("valid response")
+}
+
+/// A `+json` Fetch error response (empty body, status in headers).
+fn json_error(code: Code, message: &str) -> Response<ResBody> {
+    json_fetch_response(Bytes::new(), code as u32, message, &HeaderMap::new(), &HeaderMap::new())
 }
 
 /// Turn a length-prefixed `+proto` Fetch request body (`[u32 len | message]`) into a
