@@ -5,7 +5,8 @@ Verdict: the doc is largely accurate — routing rules, close codes, frame shape
 transcoding, and the auth handshake all match the code, with solid coverage on the
 happy paths. Three real behavioral drifts, one internal doc contradiction, and a
 cluster of test gaps concentrated in the httprule subset and the proxy's JSON
-handling.
+handling. Drift 2 (client close-code reconstruction) and drift 3 (keepalive) are
+fixed as of 2026-07-04; drift 1 remains open.
 
 ## Drift: doc says X, code does Y
 
@@ -27,38 +28,67 @@ from the upstream. No test covers proxy WS `+json`. Fix: treat the two `+json`
 subprotocol variants like the native server treats unsupported codecs — accept
 the upgrade, close `4012`.
 
-### 2. The client never reconstructs a `Status` from the close frame
+### 2. The client never reconstructs a `Status` from the close frame — RESOLVED (2026-07-04)
 
 PROTOCOL.md: the JS client "reads `CloseEvent.code`/`.reason` and reconstructs a
-`Status`". Server side is fully implemented and tested — close before the read
+`Status`". Server side was already implemented and tested — close before the read
 loop (`crates/server/src/ws.rs:76-80`), `4000 + code` with truncated reason
 (`ws.rs:192-198`), asserted by `crates/server/tests/auth.rs:89-99`.
 
-Client side is not: both close listeners discard the event
-(`clients/typescript/src/ws-transport.ts:136`, `:311`) and `onClose()` always
-emits `UNAVAILABLE "websocket closed"`. An auth rejection is indistinguishable
-from the server being down, and UNAVAILABLE is conventionally retryable while
-UNAUTHENTICATED is not — retry loops will hammer a hopeless auth failure. Fix:
-in the close handler, map `4000 ≤ code < 4100` to `code - 4000` with
-`event.reason` as the message; fall back to UNAVAILABLE otherwise. The mock
-WebSocket in `auth-subprotocol.test.ts` never fires `close`, so it can't catch
-this until extended.
+Client side was not: both close listeners discarded the event and `onClose()`
+always emitted `UNAVAILABLE "websocket closed"`. An auth rejection was
+indistinguishable from the server being down, and UNAVAILABLE is conventionally
+retryable while UNAUTHENTICATED is not — retry loops would hammer a hopeless auth
+failure.
 
-### 3. App-level `Ping`/`Pong` exist on paper only
+Fixed in `clients/typescript/src/ws-transport.ts`: a `statusForClose(event)`
+helper maps a private close code (`4000 + gRPC code`, range 4000..=4016) to the
+gRPC status with `event.reason` as the message; any other close (normal 1000,
+abnormal 1006, or an `error` event with no CloseEvent) falls back to
+UNAVAILABLE. Both `SingleStreamConn.onClose` and `MultiplexConn.onClose` now
+pass the `CloseEvent` through it; the multiplex path fans the reconstructed
+status out to every open stream. Covered by
+`clients/typescript/test/ws-close-status.test.ts` — mock-driven cases for both
+transport modes (each gRPC code, out-of-range codes, error events, fan-out) plus
+one real `ws` server that closes with `4016` to exercise a genuine
+`CloseEvent.code`/`.reason`.
 
-PROTOCOL.md presents them as app-level keepalive on both codecs. Reality:
+### 3. App-level `Ping`/`Pong` exist on paper only — RESOLVED (2026-07-04)
 
-- Declared only in the binary envelope (`proto/grpc_webnext.proto:25-26`); the
-  JSON codec has no wire form for them (`crates/core/src/json_frame.rs`).
-- The server's frame dispatcher falls through on them
-  (`crates/server/src/ws.rs:306`), so a Ping would never get a Pong back.
-- Nothing ever sends one — not the TS client, not the proxy. The proxy's
-  "ping/pong handled by tungstenite" comment refers to WS *protocol-level*
-  ping/pong, a different layer browsers can't drive anyway.
+PROTOCOL.md presented them as app-level keepalive on both codecs, but they were
+declared only in the binary envelope with no JSON wire form, the server's
+dispatcher fell through on them, and nothing ever sent one.
 
-The rationale (idle-timeout LBs killing quiet sockets) is real, so either
-implement it (client Ping on an idle timer, server echoes Pong, plus a JSON
-form) or move it to "Reserved for later" next to fragmentation.
+Resolved by dropping the app-level frames and using **native WebSocket ping/pong
+control frames** (RFC 6455 §5.5.2) for keepalive — the right layer, since a browser
+can't send an app frame on an idle timer from JS but *does* auto-answer a server
+ping with a pong. Changes:
+
+- Removed `Ping`/`Pong` from `proto/grpc_webnext.proto` and reserved field numbers
+  6/7 (`reserved 6, 7;`) so they can't be silently reused; regenerated the Rust
+  (build.rs/prost) and TS (`npm run gen`) bindings.
+- Added `ServerConfig::ws_keepalive` and `ProxyConfig::ws_keepalive`
+  (`Option<Duration>`, default `None`). When set, the connection's writer task
+  (`crates/server/src/ws.rs`, `crates/proxy/src/ws.rs`) `select!`s a ticker and
+  emits a `TungMessage::Ping` each period; the peer's automatic pong is the return
+  traffic that keeps an idle-timeout proxy/LB from dropping a quiet stream. The
+  ticker's first tick is one period out and missed ticks are skipped (no ping
+  bursts after a busy period).
+- **Dead-peer detection (gRPC-style), added 2026-07-04.** `ws_keepalive_timeout`
+  (`Duration`, default 20s — gRPC's default) bounds the wait for a response. The
+  read loop keeps a liveness deadline that any inbound frame (the pong, or ordinary
+  data) pushes out; if nothing arrives for `ws_keepalive + ws_keepalive_timeout`,
+  the connection is dropped, surfacing `UNAVAILABLE` to its streams. This detects
+  half-open connections in seconds instead of waiting out the OS TCP timeout.
+  Notably this needed **no new shared state**: pongs already arrive in the read loop
+  and the drop is just its `break`, so the writer keeps pinging while the read loop
+  owns detection.
+- No client change needed: browsers and the Node `ws` package auto-answer pings.
+- Covered by `crates/server/tests/keepalive.rs` and `crates/proxy/tests/keepalive.rs`:
+  pings arrive when enabled and not when disabled; a peer that stops answering (a
+  client that stops polling, so tokio-tungstenite stops auto-ponging) is dropped
+  within the window; a peer that keeps answering stays connected. PROTOCOL.md's
+  keepalive paragraph documents both the ping mechanism and the timeout.
 
 ### Smaller inaccuracies
 
@@ -137,8 +167,12 @@ annotated URLs. The REST-section sentence is stale.
   `poolSize > 1` round-robin distribution, `grpc-timeout` header emission on
   Fetch unary (deadline tests all go through streaming).
 - **Fetch-path auth**: no test in `auth.rs`.
-- **Close-event handling**: blocked on drift 2; once implemented, the mock
-  WebSocket needs to fire `close` events.
+- **Close-event handling**: covered as of drift 2's fix
+  (`test/ws-close-status.test.ts`). Remaining gap: no full cross-language e2e of
+  a *native-server* handshake reject reaching the client, because the e2e
+  `devserver` fronts the upstream with the proxy (no `connect_auth` gate); the
+  reject path is covered on the Rust side (`crates/server/tests/auth.rs:89-99`)
+  and the client decode by the real-`ws` test.
 
 The through-line: happy paths are well covered on both sides of the wire;
 almost every gap is a rejection or limit branch — exactly the branches that

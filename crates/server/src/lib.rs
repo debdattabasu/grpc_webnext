@@ -83,6 +83,16 @@ pub struct ServerConfig {
     /// endpoints then require an explicit grpc-webnext content-type/subprotocol,
     /// and plain `application/json`/blank is reserved for annotated REST endpoints.
     pub allow_implicit_codec: bool,
+    /// Interval between WebSocket keepalive pings on an open streaming connection.
+    /// A native ping (RFC 6455 §5.5.2) is control-frame traffic the peer auto-answers,
+    /// so it keeps idle-timeout proxies/LBs from dropping a quiet stream. `None`
+    /// disables keepalive (the default).
+    pub ws_keepalive: Option<std::time::Duration>,
+    /// How long to wait for a peer's pong (or any frame) after a keepalive ping before
+    /// declaring the connection dead and dropping it — the gRPC `keepalive_timeout`
+    /// analogue. Only applies when `ws_keepalive` is set. Defaults to 20s (gRPC's
+    /// default); a peer silent for `ws_keepalive + ws_keepalive_timeout` is dropped.
+    pub ws_keepalive_timeout: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -93,6 +103,8 @@ impl Default for ServerConfig {
             connect_auth: None,
             stream_auth: None,
             allow_implicit_codec: false,
+            ws_keepalive: None,
+            ws_keepalive_timeout: std::time::Duration::from_secs(20),
         }
     }
 }

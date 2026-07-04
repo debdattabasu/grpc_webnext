@@ -133,7 +133,7 @@ class SingleStreamConn {
       this.pending.length = 0;
     });
     this.ws.addEventListener("message", (ev: MessageEvent) => this.onMessage(ev));
-    this.ws.addEventListener("close", () => this.onClose());
+    this.ws.addEventListener("close", (ev) => this.onClose(ev as CloseEvent));
     this.ws.addEventListener("error", () => this.onClose());
 
     // Eager open frame: carries metadata/deadline and unambiguously starts the stream.
@@ -274,9 +274,9 @@ class SingleStreamConn {
     }
   }
 
-  private onClose(): void {
+  private onClose(event?: CloseEvent): void {
     this.open_ = false;
-    this.finish({ code: Status.UNAVAILABLE, details: "websocket closed", metadata: new Metadata() });
+    this.finish(statusForClose(event));
   }
 }
 
@@ -308,7 +308,7 @@ class MultiplexConn {
       this.pending.length = 0;
     });
     this.ws.addEventListener("message", (ev: MessageEvent) => this.onMessage(ev));
-    this.ws.addEventListener("close", () => this.onClose());
+    this.ws.addEventListener("close", (ev) => this.onClose(ev as CloseEvent));
     this.ws.addEventListener("error", () => this.onClose());
   }
 
@@ -458,18 +458,37 @@ class MultiplexConn {
     handlers?.onStatus?.(status);
   }
 
-  private onClose(): void {
-    const status: StatusResult = {
-      code: Status.UNAVAILABLE,
-      details: "websocket closed",
-      metadata: new Metadata(),
-    };
+  private onClose(event?: CloseEvent): void {
+    const status = statusForClose(event);
     for (const [id, handlers] of [...this.streams]) {
       this.streams.delete(id);
       handlers.onStatus?.(status);
     }
     this.open_ = false;
   }
+}
+
+/** Private WebSocket close codes carry a gRPC status as `4000 + code` (0..=16). */
+const CLOSE_STATUS_BASE = 4000;
+
+/**
+ * Reconstruct a gRPC status from a WebSocket close. The server encodes a rejected
+ * handshake (and other pre-frame failures) into the close frame as private code
+ * `4000 + gRPC code` — gRPC codes are 0..=16, so 4000..=4016 — with the message in
+ * the reason (see PROTOCOL.md "Auth"). Any other close — a normal 1000, an abnormal
+ * 1006, or an `error` event with no CloseEvent — is a transport failure and maps to
+ * UNAVAILABLE.
+ */
+function statusForClose(event?: CloseEvent): StatusResult {
+  const code = event?.code;
+  if (code !== undefined && code >= CLOSE_STATUS_BASE && code <= CLOSE_STATUS_BASE + Status.UNAUTHENTICATED) {
+    return {
+      code: (code - CLOSE_STATUS_BASE) as Status,
+      details: event?.reason ?? "",
+      metadata: new Metadata(),
+    };
+  }
+  return { code: Status.UNAVAILABLE, details: "websocket closed", metadata: new Metadata() };
 }
 
 /** Map an http(s) base URL to its ws(s) form (base path). */

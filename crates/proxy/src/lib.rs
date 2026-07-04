@@ -55,6 +55,16 @@ pub struct ProxyConfig {
     pub retry: RetryPolicy,
     /// Max concurrent logical streams per WebSocket connection.
     pub max_concurrent_streams: usize,
+    /// Interval between WebSocket keepalive pings on an open streaming connection.
+    /// A native ping (RFC 6455 §5.5.2) is control-frame traffic the peer auto-answers,
+    /// so it keeps idle-timeout proxies/LBs from dropping a quiet stream. `None`
+    /// disables keepalive (the default).
+    pub ws_keepalive: Option<Duration>,
+    /// How long to wait for a peer's pong (or any frame) after a keepalive ping before
+    /// declaring the connection dead and dropping it — the gRPC `keepalive_timeout`
+    /// analogue. Only applies when `ws_keepalive` is set. Defaults to 20s (gRPC's
+    /// default); a peer silent for `ws_keepalive + ws_keepalive_timeout` is dropped.
+    pub ws_keepalive_timeout: Duration,
 }
 
 impl Default for ProxyConfig {
@@ -64,6 +74,8 @@ impl Default for ProxyConfig {
             max_message_bytes: 4 * 1024 * 1024,
             retry: RetryPolicy::default(),
             max_concurrent_streams: 100,
+            ws_keepalive: None,
+            ws_keepalive_timeout: Duration::from_secs(20),
         }
     }
 }
@@ -162,7 +174,11 @@ impl Proxy {
                     }
                     let channel = self.channel.clone();
                     let max_streams = self.config.max_concurrent_streams;
-                    tokio::spawn(async move { ws::serve(channel, websocket, max_streams, multi, method).await });
+                    let keepalive = self.config.ws_keepalive;
+                    let keepalive_timeout = self.config.ws_keepalive_timeout;
+                    tokio::spawn(async move {
+                        ws::serve(channel, websocket, max_streams, multi, method, keepalive, keepalive_timeout).await
+                    });
                     response.map(boxed_full)
                 }
                 Err(e) => text_response(StatusCode::BAD_REQUEST, format!("upgrade failed: {e}")),

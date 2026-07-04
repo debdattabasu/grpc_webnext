@@ -10,7 +10,14 @@ import Long from "long";
 
 export const protobufPackage = "grpc.webnext.v1";
 
-/** A single WebSocket message. Exactly one field of `kind` is set. */
+/**
+ * A single WebSocket message. Exactly one field of `kind` is set.
+ * Keepalive is NOT an application frame: it uses native WebSocket ping/pong
+ * control frames (RFC 6455 §5.5.2), which browsers auto-answer and which generate
+ * the wire traffic that keeps idle-timeout proxies from dropping a quiet stream.
+ * Field numbers 6/7 held the removed app-level Ping/Pong and are reserved so they
+ * are never reused.
+ */
 export interface Frame {
   /** open a stream (client -> server) */
   subscribe?:
@@ -31,11 +38,6 @@ export interface Frame {
   /** abort a single stream, either direction */
   reset?:
     | Reset
-    | undefined;
-  /** app-level keepalive */
-  ping?: Ping | undefined;
-  pong?:
-    | Pong
     | undefined;
   /** initial response metadata (server -> client) */
   header?: Header | undefined;
@@ -100,14 +102,6 @@ export interface Reset {
   statusMessage: string;
 }
 
-export interface Ping {
-  payload: Uint8Array;
-}
-
-export interface Pong {
-  payload: Uint8Array;
-}
-
 function createBaseFrame(): Frame {
   return {
     subscribe: undefined,
@@ -115,8 +109,6 @@ function createBaseFrame(): Frame {
     halfClose: undefined,
     trailer: undefined,
     reset: undefined,
-    ping: undefined,
-    pong: undefined,
     header: undefined,
   };
 }
@@ -137,12 +129,6 @@ export const Frame: MessageFns<Frame> = {
     }
     if (message.reset !== undefined) {
       Reset.encode(message.reset, writer.uint32(42).fork()).join();
-    }
-    if (message.ping !== undefined) {
-      Ping.encode(message.ping, writer.uint32(50).fork()).join();
-    }
-    if (message.pong !== undefined) {
-      Pong.encode(message.pong, writer.uint32(58).fork()).join();
     }
     if (message.header !== undefined) {
       Header.encode(message.header, writer.uint32(66).fork()).join();
@@ -197,22 +183,6 @@ export const Frame: MessageFns<Frame> = {
           message.reset = Reset.decode(reader, reader.uint32());
           continue;
         }
-        case 6: {
-          if (tag !== 50) {
-            break;
-          }
-
-          message.ping = Ping.decode(reader, reader.uint32());
-          continue;
-        }
-        case 7: {
-          if (tag !== 58) {
-            break;
-          }
-
-          message.pong = Pong.decode(reader, reader.uint32());
-          continue;
-        }
         case 8: {
           if (tag !== 66) {
             break;
@@ -241,8 +211,6 @@ export const Frame: MessageFns<Frame> = {
         : undefined,
       trailer: isSet(object.trailer) ? Trailer.fromJSON(object.trailer) : undefined,
       reset: isSet(object.reset) ? Reset.fromJSON(object.reset) : undefined,
-      ping: isSet(object.ping) ? Ping.fromJSON(object.ping) : undefined,
-      pong: isSet(object.pong) ? Pong.fromJSON(object.pong) : undefined,
       header: isSet(object.header) ? Header.fromJSON(object.header) : undefined,
     };
   },
@@ -263,12 +231,6 @@ export const Frame: MessageFns<Frame> = {
     }
     if (message.reset !== undefined) {
       obj.reset = Reset.toJSON(message.reset);
-    }
-    if (message.ping !== undefined) {
-      obj.ping = Ping.toJSON(message.ping);
-    }
-    if (message.pong !== undefined) {
-      obj.pong = Pong.toJSON(message.pong);
     }
     if (message.header !== undefined) {
       obj.header = Header.toJSON(message.header);
@@ -294,8 +256,6 @@ export const Frame: MessageFns<Frame> = {
       ? Trailer.fromPartial(object.trailer)
       : undefined;
     message.reset = (object.reset !== undefined && object.reset !== null) ? Reset.fromPartial(object.reset) : undefined;
-    message.ping = (object.ping !== undefined && object.ping !== null) ? Ping.fromPartial(object.ping) : undefined;
-    message.pong = (object.pong !== undefined && object.pong !== null) ? Pong.fromPartial(object.pong) : undefined;
     message.header = (object.header !== undefined && object.header !== null)
       ? Header.fromPartial(object.header)
       : undefined;
@@ -1001,122 +961,6 @@ export const Reset: MessageFns<Reset> = {
     message.streamId = object.streamId ?? 0;
     message.statusCode = object.statusCode ?? 0;
     message.statusMessage = object.statusMessage ?? "";
-    return message;
-  },
-};
-
-function createBasePing(): Ping {
-  return { payload: new Uint8Array(0) };
-}
-
-export const Ping: MessageFns<Ping> = {
-  encode(message: Ping, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.payload.length !== 0) {
-      writer.uint32(10).bytes(message.payload);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): Ping {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBasePing();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.payload = reader.bytes();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): Ping {
-    return { payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0) };
-  },
-
-  toJSON(message: Ping): unknown {
-    const obj: any = {};
-    if (message.payload.length !== 0) {
-      obj.payload = base64FromBytes(message.payload);
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<Ping>): Ping {
-    return Ping.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<Ping>): Ping {
-    const message = createBasePing();
-    message.payload = object.payload ?? new Uint8Array(0);
-    return message;
-  },
-};
-
-function createBasePong(): Pong {
-  return { payload: new Uint8Array(0) };
-}
-
-export const Pong: MessageFns<Pong> = {
-  encode(message: Pong, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.payload.length !== 0) {
-      writer.uint32(10).bytes(message.payload);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): Pong {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBasePong();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.payload = reader.bytes();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): Pong {
-    return { payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0) };
-  },
-
-  toJSON(message: Pong): unknown {
-    const obj: any = {};
-    if (message.payload.length !== 0) {
-      obj.payload = base64FromBytes(message.payload);
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<Pong>): Pong {
-    return Pong.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<Pong>): Pong {
-    const message = createBasePong();
-    message.payload = object.payload ?? new Uint8Array(0);
     return message;
   },
 };

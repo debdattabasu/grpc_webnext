@@ -61,6 +61,10 @@ pub async fn serve(
 ) {
     let transcoder = config.transcoder.clone();
     let stream_auth = config.stream_auth.clone();
+    let keepalive = config.ws_keepalive;
+    // Max silence tolerated before the peer is declared dead: one ping interval to
+    // provoke a pong plus the ack timeout. `None` when keepalive is off.
+    let max_silence = keepalive.map(|iv| iv + config.ws_keepalive_timeout);
     let ws = match websocket.await {
         Ok(ws) => ws,
         Err(e) => {
@@ -85,9 +89,23 @@ pub async fn serve(
     let (done_tx, mut done_rx) = mpsc::channel::<u32>(64);
 
     let writer = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            if ws_sink.send(msg).await.is_err() {
-                break;
+        // Optional keepalive: emit a WebSocket ping every `keepalive` so idle-timeout
+        // proxies/LBs see traffic on a quiet stream. The peer (browser or tungstenite)
+        // answers pings with pongs automatically, so nothing else is needed either side.
+        let mut ping = keepalive.map(keepalive_interval);
+        loop {
+            tokio::select! {
+                msg = outbound_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if ws_sink.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                _ = next_tick(ping.as_mut()) => {
+                    if ws_sink.send(TungMessage::Ping(Bytes::new())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -101,13 +119,24 @@ pub async fn serve(
     let mut codec: Option<bool> = params.codec;
     // Single-stream mode: whether the one stream has been opened by a first frame.
     let mut opened = false;
+    // Keepalive liveness: any inbound frame (in particular the auto-pong to our
+    // keepalive ping) proves the peer is alive and pushes the deadline out. If nothing
+    // arrives within `max_silence`, the peer is gone — drop the connection (gRPC-style).
+    let mut deadline = max_silence.map(|d| tokio::time::Instant::now() + d);
 
     loop {
         tokio::select! {
             Some(stream_id) = done_rx.recv() => { streams.remove(&stream_id); }
+            _ = sleep_until(deadline) => {
+                tracing::debug!("ws keepalive: no pong within timeout; dropping connection");
+                break;
+            }
             incoming = ws_stream.next() => {
                 let Some(incoming) = incoming else { break };
                 let msg = match incoming { Ok(m) => m, Err(_) => break };
+                if let Some(d) = max_silence {
+                    deadline = Some(tokio::time::Instant::now() + d);
+                }
                 let decoded = match msg {
                     TungMessage::Binary(data) => {
                         if *codec.get_or_insert(false) {
@@ -195,6 +224,34 @@ fn close_for_status(status: &Status) -> TungMessage {
         code: CloseCode::from(code),
         reason: truncate_utf8(status.message(), 123).to_string().into(),
     }))
+}
+
+/// A keepalive ticker whose first tick is one full period out (not immediate) and
+/// that skips missed ticks rather than bursting catch-up pings after a busy period.
+fn keepalive_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut i = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    i
+}
+
+/// Await the next keepalive tick, or never resolve when keepalive is disabled — so
+/// the writer's `select!` simply has no ping arm in that case.
+async fn next_tick(interval: Option<&mut tokio::time::Interval>) {
+    match interval {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolve at `deadline`, or never when it is `None` (keepalive off) — so the read
+/// loop's `select!` simply has no liveness-timeout arm in that case.
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Truncate to at most `max` bytes on a char boundary.

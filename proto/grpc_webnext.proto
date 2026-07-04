@@ -15,15 +15,20 @@ package grpc.webnext.v1;
 // ============================================================================
 
 // A single WebSocket message. Exactly one field of `kind` is set.
+// Keepalive is NOT an application frame: it uses native WebSocket ping/pong
+// control frames (RFC 6455 §5.5.2), which browsers auto-answer and which generate
+// the wire traffic that keeps idle-timeout proxies from dropping a quiet stream.
+// Field numbers 6/7 held the removed app-level Ping/Pong and are reserved so they
+// are never reused.
 message Frame {
+  reserved 6, 7;
+  reserved "ping", "pong";
   oneof kind {
     Subscribe subscribe = 1;   // open a stream (client -> server)
     Message   message   = 2;   // one gRPC message, either direction
     HalfClose half_close = 3;  // client done sending (client -> server)
     Trailer   trailer   = 4;   // stream end + status (server -> client)
     Reset     reset     = 5;   // abort a single stream, either direction
-    Ping      ping      = 6;   // app-level keepalive
-    Pong      pong      = 7;
     Header    header    = 8;   // initial response metadata (server -> client)
   }
 }
@@ -77,6 +82,3 @@ message Reset {
   uint32 status_code = 2;            // gRPC status code (e.g. CANCELLED, UNIMPLEMENTED)
   string status_message = 3;
 }
-
-message Ping { bytes payload = 1; }
-message Pong { bytes payload = 1; }

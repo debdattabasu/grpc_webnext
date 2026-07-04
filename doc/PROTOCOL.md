@@ -159,8 +159,27 @@ Streams are assigned round-robin across a client-side pool. A second `Subscribe`
 non-`multi` connection is impossible (the frames carry no method); the wire otherwise
 matches single-stream with `streamId` added. See `crates/core/src/json_frame.rs`.
 
-**One message per frame, no fragmentation** (both codecs). `Ping`/`Pong` are app-level
-keepalive (HTTP/2 PING is not reachable from browser JS).
+**One message per frame, no fragmentation** (both codecs).
+
+**Keepalive** uses native **WebSocket ping/pong control frames** (RFC 6455 §5.5.2),
+not application frames — HTTP/2 PING isn't reachable from browser JS, and a browser
+can't send a WS ping from JS either, but it *does* auto-answer a server ping with a
+pong. So the **server drives keepalive** (mirroring gRPC's `keepalive_time` /
+`keepalive_timeout`):
+
+- With `ServerConfig::ws_keepalive` (or `ProxyConfig::ws_keepalive`) set to an
+  interval, an open streaming connection emits a ping each period. The peer's
+  automatic pong is the return traffic that stops an idle-timeout proxy/LB from
+  dropping a quiet stream.
+- `ws_keepalive_timeout` (default 20s, gRPC's default) bounds the wait for a
+  response. Any inbound frame — the pong, or ordinary stream data — proves liveness;
+  if **nothing** arrives for `ws_keepalive + ws_keepalive_timeout`, the peer is
+  presumed dead and the connection is **dropped** (the streams then surface
+  `UNAVAILABLE`). This detects half-open connections in seconds instead of waiting
+  out the OS TCP timeout.
+
+Both are off by default (`ws_keepalive: None`). There is no application-level
+ping/pong frame (the `Frame` oneof reserves the old field numbers 6/7).
 
 ### Auth
 
