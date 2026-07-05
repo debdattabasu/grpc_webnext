@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Reset, Subscribe};
 use grpc_webnext_core::{decode_frame, encode_frame};
-use grpc_webnext_server::{bind_and_serve, ServerConfig};
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig};
 use prost::Message;
 use testecho::pb::echo_server::EchoServer;
 use testecho::pb::EchoRequest;
@@ -24,7 +24,7 @@ async fn reset_cancels_in_process_handler() {
     let routes = Routes::new(EchoServer::new(svc));
     // Single-stream mode takes the method from the URL path.
     let config = ServerConfig { allow_implicit_codec: true, ..Default::default() };
-    let (addr, _handle) = bind_and_serve(routes, config).await.unwrap();
+    let (addr, _handle) = bind_and_serve_in_process(routes, config).await.unwrap();
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/echo.v1.Echo/Hang"))
         .await

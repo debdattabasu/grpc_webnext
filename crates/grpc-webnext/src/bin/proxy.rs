@@ -1,13 +1,13 @@
-//! grpc-webnext proxy binary.
+//! grpc-webnext standalone proxy binary — front any upstream gRPC server.
 //!
 //! Env:
 //!   * `LISTEN`, `UPSTREAM`
 //!   * `+json` descriptor source, from `SCHEMA=reflection` (fetch from the upstream's
 //!     reflection service) and/or `DESCRIPTOR_SET=<path>` (a compiled `FileDescriptorSet`):
-//!       - neither                       → binary-only
-//!       - `SCHEMA=reflection`           → reflection
-//!       - `DESCRIPTOR_SET`              → bundled
-//!       - both                          → reflection, with the bundle as fallback
+//!       - neither             → binary-only
+//!       - `SCHEMA=reflection` → reflection
+//!       - `DESCRIPTOR_SET`    → bundled
+//!       - both                → reflection, with the bundle as fallback
 //!   * `REFLECTION_TTL_SECS` — reflection refresh interval (default 4h).
 //!   * `ADMIN_RELOAD_PATH` — if set, `POST` to this path forces a reflection reload.
 
@@ -15,19 +15,17 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use grpc_webnext_proxy::{serve, ProxyConfig, SchemaSource};
+use grpc_webnext::{serve_proxy, ProxyConfig, SchemaSource};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let listen: SocketAddr = std::env::var("LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:8080".into())
-        .parse()?;
-    let upstream: http::Uri = std::env::var("UPSTREAM")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".into())
-        .parse()?;
+    let listen: SocketAddr =
+        std::env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into()).parse()?;
+    let upstream: http::Uri =
+        std::env::var("UPSTREAM").unwrap_or_else(|_| "http://127.0.0.1:50051".into()).parse()?;
 
     // Descriptor source for `+json`, composed from the two env knobs.
     let reflection = std::env::var("SCHEMA").ok().as_deref() == Some("reflection");
@@ -48,6 +46,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%listen, upstream = %config.upstream, "grpc-webnext-proxy listening");
     let listener = TcpListener::bind(listen).await?;
-    serve(listener, config).await?;
+    serve_proxy(listener, config).await?;
     Ok(())
 }

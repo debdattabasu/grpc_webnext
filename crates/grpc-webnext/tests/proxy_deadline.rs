@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Subscribe};
 use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame, encode_request_body};
-use grpc_webnext_proxy::{bind_and_serve, ProxyConfig, CT_PROTO};
+use grpc_webnext::{bind_and_serve_proxy, ProxyConfig, CT_PROTO};
 use prost::Message;
 use testecho::pb::{EchoRequest, SleepRequest};
 use tokio::time::timeout;
@@ -19,7 +19,7 @@ fn frame(kind: Kind) -> TungMessage {
 }
 
 async fn proxy_over(upstream: std::net::SocketAddr) -> String {
-    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
+    let (proxy_addr, _handle) = bind_and_serve_proxy(ProxyConfig {
         upstream: format!("http://{upstream}").parse().unwrap(),
         max_message_bytes: 4 * 1024 * 1024,
         ..Default::default()
@@ -59,7 +59,7 @@ async fn streaming_deadline_trailer_and_upstream_cancel() {
     // Single-stream: the method is the WS URL path.
     let url = format!("{}/echo.v1.Echo/Hang", base.replacen("http", "ws", 1));
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut ws = connect_proto(&url).await;
     ws.send(frame(Kind::Subscribe(Subscribe {
         stream_id: 1,
         method: "/echo.v1.Echo/Hang".into(),
@@ -94,4 +94,16 @@ async fn streaming_deadline_trailer_and_upstream_cancel() {
         timeout(Duration::from_secs(5), cancel_rx.recv()).await.is_ok(),
         "deadline did not cancel the upstream call",
     );
+}
+
+/// Connect a single-stream binary WebSocket (offers the `grpc-webnext+proto` subprotocol,
+/// as a real SDK client does).
+async fn connect_proto(
+    url: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "grpc-webnext+proto".parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.unwrap().0
 }

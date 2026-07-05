@@ -7,6 +7,6 @@ publish = false
 description = "Dev harness: runs testecho behind grpc-webnext-proxy; prints the proxy address."
 
 [dependencies]
-grpc-webnext-proxy = { path = "../proxy" }
+grpc-webnext = { path = "../grpc-webnext" }
 testecho = { path = "../testecho" }
 tokio = { version = "1", features = ["full"] }

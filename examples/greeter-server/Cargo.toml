@@ -7,8 +7,7 @@ publish = false
 description = "Example: a Greeter service served over grpc-webnext (native server) + native gRPC on one port."
 
 [dependencies]
-grpc-webnext-server = { path = "../../crates/server" }
-grpc-webnext-core = { path = "../../crates/core" }
+grpc-webnext = { path = "../../crates/grpc-webnext" }
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"

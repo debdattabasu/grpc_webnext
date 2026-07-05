@@ -6,7 +6,7 @@
 
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::json_frame::{decode_json_frame, encode_json_frame, JsonFrame};
-use grpc_webnext_proxy::{bind_and_serve, ProxyConfig, SchemaSource, CT_JSON};
+use grpc_webnext::{bind_and_serve_proxy, ProxyConfig, SchemaSource, CT_JSON};
 use serde_json::json;
 use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message as TungMessage;
 
 /// Start a proxy in front of `upstream` with the given descriptor source.
 async fn proxy_over(upstream: SocketAddr, schema: SchemaSource) -> String {
-    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
+    let (proxy_addr, _handle) = bind_and_serve_proxy(ProxyConfig {
         upstream: format!("http://{upstream}").parse().unwrap(),
         max_message_bytes: 4 * 1024 * 1024,
         schema,
@@ -27,7 +27,7 @@ async fn proxy_over(upstream: SocketAddr, schema: SchemaSource) -> String {
 
 /// Start a proxy with a small message-size limit, to exercise the size guard.
 async fn proxy_over_limit(upstream: SocketAddr, schema: SchemaSource, max_message_bytes: usize) -> String {
-    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
+    let (proxy_addr, _handle) = bind_and_serve_proxy(ProxyConfig {
         upstream: format!("http://{upstream}").parse().unwrap(),
         max_message_bytes,
         schema,
@@ -362,7 +362,7 @@ async fn ws_rest_repeat_reflection() {
 // --- Management: force reflection reload -------------------------------------
 
 async fn proxy_with_admin(upstream: SocketAddr, schema: SchemaSource, admin: &str) -> String {
-    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
+    let (proxy_addr, _handle) = bind_and_serve_proxy(ProxyConfig {
         upstream: format!("http://{upstream}").parse().unwrap(),
         max_message_bytes: 4 * 1024 * 1024,
         schema,

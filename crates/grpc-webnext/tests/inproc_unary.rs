@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use grpc_webnext_core::{decode_response_body, encode_request_body};
-use grpc_webnext_server::{bind_and_serve, ServerConfig, CT_PROTO};
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig, CT_PROTO};
 use prost::Message;
 use testecho::pb::echo_client::EchoClient;
 use testecho::pb::echo_server::EchoServer;
@@ -16,7 +16,7 @@ async fn start() -> String {
 
 async fn start_with(svc: EchoSvc) -> String {
     let routes = Routes::new(EchoServer::new(svc));
-    let (addr, _handle) = bind_and_serve(routes, ServerConfig::default()).await.unwrap();
+    let (addr, _handle) = bind_and_serve_in_process(routes, ServerConfig::default()).await.unwrap();
     format!("http://{addr}")
 }
 

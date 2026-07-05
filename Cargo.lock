@@ -199,7 +199,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 name = "devserver"
 version = "0.1.0"
 dependencies = [
- "grpc-webnext-proxy",
+ "grpc-webnext",
  "testecho",
  "tokio",
 ]
@@ -253,8 +253,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "futures",
- "grpc-webnext-core",
- "grpc-webnext-server",
+ "grpc-webnext",
  "prost",
  "tokio",
  "tokio-stream",
@@ -424,29 +423,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "grpc-webnext-core"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "http",
- "prost",
- "prost-build",
- "prost-reflect",
- "serde",
- "serde_json",
- "thiserror",
- "tonic",
-]
-
-[[package]]
-name = "grpc-webnext-proxy"
+name = "grpc-webnext"
 version = "0.1.0"
 dependencies = [
  "async-stream",
  "bytes",
  "futures",
  "grpc-webnext-core",
- "grpc-webnext-transport",
  "http",
  "http-body-util",
  "hyper",
@@ -469,38 +452,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "grpc-webnext-server"
+name = "grpc-webnext-core"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "bytes",
- "futures",
- "grpc-webnext-core",
- "grpc-webnext-transport",
  "http",
- "http-body-util",
- "hyper",
- "hyper-tungstenite",
- "hyper-util",
  "prost",
- "reqwest",
+ "prost-build",
+ "prost-reflect",
+ "serde",
  "serde_json",
- "testecho",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
+ "thiserror",
  "tonic",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "grpc-webnext-transport"
-version = "0.1.0"
-dependencies = [
- "grpc-webnext-core",
- "hyper-tungstenite",
- "tokio",
 ]
 
 [[package]]

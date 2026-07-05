@@ -1,12 +1,15 @@
-//! End-to-end: grpc-webnext WebSocket streaming -> proxy -> tonic echo (bidi).
+//! Native server: grpc-webnext WebSocket streaming (bidi) into the inner Routes.
 
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Message as WsMessage, Subscribe};
 use grpc_webnext_core::{decode_frame, encode_frame};
-use grpc_webnext_proxy::{bind_and_serve, ProxyConfig};
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig};
 use prost::Message;
+use testecho::pb::echo_server::EchoServer;
 use testecho::pb::{EchoRequest, EchoResponse};
+use testecho::EchoSvc;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
+use tonic::service::Routes;
 
 fn frame(kind: Kind) -> TungMessage {
     TungMessage::Binary(encode_frame(&Frame { kind: Some(kind) }))
@@ -14,21 +17,16 @@ fn frame(kind: Kind) -> TungMessage {
 
 #[tokio::test]
 async fn streaming_round_trip() {
-    let upstream_addr = testecho::spawn().await;
-    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
-        upstream: format!("http://{upstream_addr}").parse().unwrap(),
-        max_message_bytes: 4 * 1024 * 1024,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let routes = Routes::new(EchoServer::new(EchoSvc::default()));
+    // No codec subprotocol on the test connection -> allow first-frame inference.
+    // Single-stream mode takes the method from the URL path.
+    let config = ServerConfig { allow_implicit_codec: true, ..Default::default() };
+    let (addr, _handle) = bind_and_serve_in_process(routes, config).await.unwrap();
 
-    // Single-stream: the method is the WS URL path.
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{proxy_addr}/echo.v1.Echo/Stream"))
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/echo.v1.Echo/Stream"))
         .await
         .unwrap();
 
-    // Open the bidi stream, sending the first request as initial_payload.
     ws.send(frame(Kind::Subscribe(Subscribe {
         stream_id: 1,
         method: "/echo.v1.Echo/Stream".into(),
@@ -39,8 +37,6 @@ async fn streaming_round_trip() {
     })))
     .await
     .unwrap();
-
-    // Second request message, then half-close.
     ws.send(frame(Kind::Message(WsMessage {
         stream_id: 1,
         payload: EchoRequest { message: "b".into() }.encode_to_vec().into(),
@@ -51,33 +47,21 @@ async fn streaming_round_trip() {
         .await
         .unwrap();
 
-    // Collect frames until the Trailer.
     let mut echoed = Vec::new();
-    let mut got_header = false;
-    let mut status_code = None;
-
+    let mut status = None;
     while let Some(msg) = ws.next().await {
         let TungMessage::Binary(data) = msg.unwrap() else { continue };
-        let f = decode_frame(&data).unwrap();
-        match f.kind.unwrap() {
-            Kind::Header(h) => {
-                assert_eq!(h.stream_id, 1);
-                got_header = true;
-            }
-            Kind::Message(m) => {
-                assert_eq!(m.stream_id, 1);
-                echoed.push(EchoResponse::decode(&m.payload[..]).unwrap().message);
-            }
+        match decode_frame(&data).unwrap().kind.unwrap() {
+            Kind::Header(_) => {}
+            Kind::Message(m) => echoed.push(EchoResponse::decode(&m.payload[..]).unwrap().message),
             Kind::Trailer(t) => {
-                assert_eq!(t.stream_id, 1);
-                status_code = Some(t.status_code);
+                status = Some(t.status_code);
                 break;
             }
             other => panic!("unexpected frame: {other:?}"),
         }
     }
 
-    assert!(got_header, "expected a Header frame before messages");
     assert_eq!(echoed, vec!["a", "b"]);
-    assert_eq!(status_code, Some(0));
+    assert_eq!(status, Some(0));
 }

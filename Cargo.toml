@@ -2,9 +2,7 @@
 resolver = "2"
 members = [
     "crates/core",
-    "crates/transport",
-    "crates/proxy",
-    "crates/server",
+    "crates/grpc-webnext",
     "crates/testecho",
     "crates/devserver",
     "examples/greeter-server",
@@ -17,4 +15,4 @@ repository = "https://github.com/grpc-webnext/grpc-webnext"
 
 [workspace.dependencies]
 grpc-webnext-core = { path = "crates/core" }
-grpc-webnext-transport = { path = "crates/transport" }
+grpc-webnext = { path = "crates/grpc-webnext" }

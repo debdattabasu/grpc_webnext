@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use grpc_webnext_server::{bind_and_serve, ServerConfig};
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig};
 use testecho::pb::echo_server::EchoServer;
 use testecho::EchoSvc;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
@@ -33,7 +33,7 @@ async fn start(config: ServerConfig) -> String {
     let routes = Routes::new(EchoServer::new(EchoSvc::default()));
     // Dropping the JoinHandle detaches the server task rather than aborting it, so
     // the server keeps running for the test body.
-    let (addr, _handle) = bind_and_serve(routes, config).await.unwrap();
+    let (addr, _handle) = bind_and_serve_in_process(routes, config).await.unwrap();
     format!("ws://{addr}/echo.v1.Echo/Stream")
 }
 

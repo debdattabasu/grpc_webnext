@@ -6,8 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
-use grpc_webnext_core::Transcoder;
-use grpc_webnext_server::{bind_and_serve, ServerConfig};
+use grpc_webnext::Transcoder;
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 pub mod pb {
@@ -92,7 +92,7 @@ impl Greeter for GreeterSvc {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let routes = Routes::new(GreeterServer::new(GreeterSvc::default()));
     let transcoder = Arc::new(Transcoder::from_file_descriptor_set(FILE_DESCRIPTOR_SET)?);
-    let (addr, handle) = bind_and_serve(
+    let (addr, handle) = bind_and_serve_in_process(
         routes,
         ServerConfig { transcoder: Some(transcoder), ..Default::default() },
     )

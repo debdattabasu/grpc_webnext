@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use grpc_webnext_core::{decode_response_body, encode_request_body};
-use grpc_webnext_proxy::{bind_and_serve, ProxyConfig, CT_PROTO};
+use grpc_webnext::{bind_and_serve_proxy, ProxyConfig, CT_PROTO};
 use prost::Message;
 use testecho::pb::{EchoRequest, EchoResponse};
 
@@ -11,7 +11,7 @@ async fn setup() -> String {
 }
 
 async fn setup_over(upstream_addr: std::net::SocketAddr) -> String {
-    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
+    let (proxy_addr, _handle) = bind_and_serve_proxy(ProxyConfig {
         upstream: format!("http://{upstream_addr}").parse().unwrap(),
         max_message_bytes: 4 * 1024 * 1024,
         ..Default::default()

@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, Subscribe};
 use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame, encode_request_body};
-use grpc_webnext_server::{bind_and_serve, ws_bearer_token, ServerConfig, CT_PROTO};
+use grpc_webnext::{bind_and_serve_in_process, ws_bearer_token, ServerConfig, CT_PROTO};
 use prost::Message as _;
 use testecho::pb::echo_client::EchoClient;
 use testecho::pb::echo_server::EchoServer;
@@ -20,7 +20,7 @@ use tonic::{Code, Status};
 
 async fn start(config: ServerConfig) -> String {
     let routes = tonic::service::Routes::new(EchoServer::new(EchoSvc::default()));
-    let (addr, _handle) = bind_and_serve(routes, config).await.unwrap();
+    let (addr, _handle) = bind_and_serve_in_process(routes, config).await.unwrap();
     format!("ws://{addr}")
 }
 
@@ -310,7 +310,7 @@ async fn fetch_native_passthrough_is_exempt_from_stream_auth() {
 
 #[test]
 fn ws_bearer_token_extracts_the_token() {
-    use grpc_webnext_server::ws_bearer_token;
+    use grpc_webnext::ws_bearer_token;
     let mut h = http::HeaderMap::new();
     h.insert(
         "sec-websocket-protocol",

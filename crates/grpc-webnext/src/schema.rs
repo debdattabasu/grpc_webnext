@@ -125,6 +125,13 @@ async fn refresh_loop(state: Arc<ReflectionState>) {
 }
 
 impl Schema {
+    /// Build a schema from an already-constructed transcoder — the in-process case, where
+    /// the descriptors live in memory and there is no upstream to reflect against. `None`
+    /// means no `+json` transcoder is configured.
+    pub fn from_transcoder(transcoder: Option<Arc<Transcoder>>) -> Self {
+        Self { inner: transcoder.map(Inner::Bundled).unwrap_or(Inner::None) }
+    }
+
     /// Build a resolver. The `Bundled` set is parsed eagerly so a bad descriptor set
     /// fails at startup; `channel` is the upstream connection reused for reflection, and
     /// `ttl` is the reflection refresh interval. Call [`Schema::start`] afterwards to
@@ -188,7 +195,7 @@ impl Schema {
     pub async fn transcoder_any(&self) -> Result<Arc<Transcoder>, Status> {
         match &self.inner {
             Inner::None => Err(Status::unimplemented(
-                "this proxy is binary-only; enable upstream reflection or bundle a descriptor set to serve +json",
+                "no +json transcoder configured (pass a transcoder in-process, or enable upstream reflection / bundle a descriptor set on the proxy)",
             )),
             Inner::Bundled(tc) => Ok(tc.clone()),
             Inner::Reflection(state) => state.transcoder().await,

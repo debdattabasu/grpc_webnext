@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures::{SinkExt, StreamExt};
 use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Message as WsMessage, Subscribe};
 use grpc_webnext_core::{decode_frame, encode_frame, Transcoder};
-use grpc_webnext_server::{bind_and_serve, ServerConfig, CT_JSON};
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig, CT_JSON};
 use prost::Message as _;
 use testecho::pb::echo_server::EchoServer;
 use testecho::pb::{EchoRequest, EchoResponse};
@@ -44,7 +44,7 @@ async fn start_json_server_lax() -> String {
 async fn start_json_server_impl(allow_implicit_codec: bool) -> String {
     let transcoder = Arc::new(Transcoder::from_file_descriptor_set(testecho::FILE_DESCRIPTOR_SET).unwrap());
     let routes = Routes::new(EchoServer::new(EchoSvc::default()));
-    let (addr, _handle) = bind_and_serve(
+    let (addr, _handle) = bind_and_serve_in_process(
         routes,
         ServerConfig { transcoder: Some(transcoder), allow_implicit_codec, ..Default::default() },
     )
@@ -57,7 +57,7 @@ async fn start_json_server_impl(allow_implicit_codec: bool) -> String {
 async fn start_json_server_small_limit(max_message_bytes: usize) -> String {
     let transcoder = Arc::new(Transcoder::from_file_descriptor_set(testecho::FILE_DESCRIPTOR_SET).unwrap());
     let routes = Routes::new(EchoServer::new(EchoSvc::default()));
-    let (addr, _handle) = bind_and_serve(
+    let (addr, _handle) = bind_and_serve_in_process(
         routes,
         ServerConfig { transcoder: Some(transcoder), max_message_bytes, ..Default::default() },
     )
@@ -253,7 +253,7 @@ async fn fetch_json_without_transcoder_is_unimplemented() {
     // (HTTP 200), not an HTTP 501 — the JSON codec always carries status in a header,
     // matching the proxy so the two `+json` surfaces are indistinguishable.
     let routes = Routes::new(EchoServer::new(EchoSvc::default()));
-    let (addr, _handle) = bind_and_serve(routes, ServerConfig::default()).await.unwrap();
+    let (addr, _handle) = bind_and_serve_in_process(routes, ServerConfig::default()).await.unwrap();
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/echo.v1.Echo/Unary"))
         .header("content-type", CT_JSON_STR)

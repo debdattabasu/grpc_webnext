@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 
 fn main() {
-    // Generate a client stub for the gRPC server-reflection service (v1 + the
-    // older v1alpha fallback) so the proxy can fetch message descriptors from an
-    // upstream at runtime and transcode `+json`. Client-only: the proxy never
-    // *serves* reflection.
+    // Generate a client stub for the gRPC server-reflection service (v1 + the older
+    // v1alpha fallback) so the proxy backend can fetch message descriptors from an
+    // upstream at runtime and transcode `+json`. Client-only: we never *serve* reflection.
     let protos = ["proto/reflection_v1.proto", "proto/reflection_v1alpha.proto"];
     for p in protos {
         println!("cargo:rerun-if-changed={p}");

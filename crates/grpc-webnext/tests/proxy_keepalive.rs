@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use grpc_webnext_proxy::{bind_and_serve, ProxyConfig};
+use grpc_webnext::{bind_and_serve_proxy, ProxyConfig};
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -27,7 +27,7 @@ async fn saw_ping(ws: &mut Ws, budget: Duration) -> bool {
 
 async fn start(ws_keepalive: Option<Duration>, ws_keepalive_timeout: Duration) -> String {
     let upstream_addr = testecho::spawn().await;
-    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
+    let (proxy_addr, _handle) = bind_and_serve_proxy(ProxyConfig {
         upstream: format!("http://{upstream_addr}").parse().unwrap(),
         ws_keepalive,
         ws_keepalive_timeout,
@@ -58,7 +58,7 @@ async fn closed_within(ws: &mut Ws, budget: Duration) -> bool {
 #[tokio::test]
 async fn proxy_sends_keepalive_pings_on_idle_connection() {
     let url = start(Some(Duration::from_millis(50)), Duration::from_secs(20)).await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut ws = connect_proto(&url).await;
     assert!(
         saw_ping(&mut ws, Duration::from_secs(2)).await,
         "expected a keepalive ping within a few periods",
@@ -68,7 +68,7 @@ async fn proxy_sends_keepalive_pings_on_idle_connection() {
 #[tokio::test]
 async fn no_keepalive_pings_by_default() {
     let url = start(None, Duration::from_secs(20)).await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut ws = connect_proto(&url).await;
     assert!(
         !saw_ping(&mut ws, Duration::from_millis(300)).await,
         "no keepalive ping should arrive when ws_keepalive is disabled",
@@ -78,7 +78,7 @@ async fn no_keepalive_pings_by_default() {
 #[tokio::test]
 async fn drops_connection_that_stops_ponging() {
     let url = start(Some(Duration::from_millis(50)), Duration::from_millis(100)).await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut ws = connect_proto(&url).await;
 
     // Do NOT read for a while: tokio-tungstenite only auto-pongs while polled, so this
     // simulates a peer gone silent. Within keepalive + timeout (~150ms) the proxy must
@@ -93,11 +93,23 @@ async fn drops_connection_that_stops_ponging() {
 #[tokio::test]
 async fn keeps_connection_that_keeps_ponging() {
     let url = start(Some(Duration::from_millis(50)), Duration::from_millis(100)).await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let mut ws = connect_proto(&url).await;
 
     // Keep reading (auto-pong) across many keepalive periods: a healthy peer stays up.
     assert!(
         !closed_within(&mut ws, Duration::from_millis(500)).await,
         "a peer that keeps answering pings must stay connected",
     );
+}
+
+/// Connect a single-stream binary WebSocket (offers the `grpc-webnext+proto` subprotocol,
+/// as a real SDK client does).
+async fn connect_proto(
+    url: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "grpc-webnext+proto".parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.unwrap().0
 }
