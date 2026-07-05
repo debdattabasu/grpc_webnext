@@ -106,13 +106,17 @@ The protocol *vocabulary* is unified already; only the *orchestration* is duplic
 
 ## Proposed path (phased, lowest-risk first)
 
-- **Phase 0 — dedupe the pure copies (no abstraction).** Move the character-identical
-  helpers into core: `decode_binary`, `decode_text`, `to_tung`, `keepalive_interval`,
-  `next_tick`, `sleep_until`, `frame_upstream_request`, `json_fetch_response`, the
-  trailer-block streaming builder, `EMPTY_MESSAGE_BLOCK`, `boxed_full`, `text_response`.
-  Zero behavioral risk, immediate; removes the most drift-prone code (the frame codec and
-  keepalive helpers are exactly where divergences hide). Cuts a few hundred duplicated
-  lines on its own.
+- **Phase 0 — dedupe the pure copies (no abstraction).** ✅ **Done 2026-07-05.** Created
+  the `grpc-webnext-transport` crate (`crates/transport`) and moved the character-identical
+  WebSocket helpers there: `decode_binary`, `decode_text`, `to_tung`, `keepalive_interval`,
+  `next_tick`, `sleep_until` — the frame codec and keepalive timing, i.e. exactly where the
+  divergences kept appearing. They now have a single home; both `ws.rs` files shrank ~80
+  lines each. (A new crate rather than `core` because these touch `hyper-tungstenite` /
+  `tokio::time`, which don't belong in the pure wire-primitives crate — and this is the
+  eventual home for Phase 1.) Still-pending pure copies that carry a crate-local `ResBody`
+  in their signature — `frame_upstream_request`, `text_response`, `boxed_full`, the
+  trailer-block streaming builder, `EMPTY_MESSAGE_BLOCK` — fold in with Phase 1, once a
+  canonical `ResBody`/`BoxError` lives in the transport crate.
 - **Phase 1 — the `Backend` trait + shared handlers.** Define
   `trait Backend { async fn call(&self, req: Request<TonicBody>) -> Result<Response<BoxBody>, BoxError>; fn schema(&self) -> &Schema; fn stream_auth(&self) -> Option<&StreamAuthFn>; }`
   plus a shared config. Move `handle` / `unary` / `json_fetch` / `ws::serve` /

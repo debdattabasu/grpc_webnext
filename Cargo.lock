@@ -446,6 +446,7 @@ dependencies = [
  "bytes",
  "futures",
  "grpc-webnext-core",
+ "grpc-webnext-transport",
  "http",
  "http-body-util",
  "hyper",
@@ -475,6 +476,7 @@ dependencies = [
  "bytes",
  "futures",
  "grpc-webnext-core",
+ "grpc-webnext-transport",
  "http",
  "http-body-util",
  "hyper",
@@ -490,6 +492,15 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "grpc-webnext-transport"
+version = "0.1.0"
+dependencies = [
+ "grpc-webnext-core",
+ "hyper-tungstenite",
+ "tokio",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ description = "Native grpc-webnext server: serve grpc-webnext and native gRPC on
 
 [dependencies]
 grpc-webnext-core.workspace = true
+grpc-webnext-transport.workspace = true
 tonic = "0.14"
 tower = "0.5"
 http = "1"
