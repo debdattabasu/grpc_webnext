@@ -1,7 +1,12 @@
 # Proxy / native-server unification audit
 
-*2026-07-05. Why the proxy and the native server are two near-duplicate codebases,
-whether they need to be, and what it would take to merge them.*
+*2026-07-05. Why the proxy and the native server were two near-duplicate codebases,
+whether they needed to be, and what it took to merge them.*
+
+> **Status: done (2026-07-05).** All phases are complete — server, proxy, transport, and
+> core are now a single `grpc-webnext` crate (library + proxy binary) whose only
+> per-surface difference is a two-variant `Backend` enum. The analysis below is retained as
+> the rationale; see "Proposed path" for what was actually done.
 
 ## TL;DR
 
@@ -117,20 +122,35 @@ The protocol *vocabulary* is unified already; only the *orchestration* is duplic
   in their signature — `frame_upstream_request`, `text_response`, `boxed_full`, the
   trailer-block streaming builder, `EMPTY_MESSAGE_BLOCK` — fold in with Phase 1, once a
   canonical `ResBody`/`BoxError` lives in the transport crate.
-- **Phase 1 — the `Backend` trait + shared handlers.** Define
-  `trait Backend { async fn call(&self, req: Request<TonicBody>) -> Result<Response<BoxBody>, BoxError>; fn schema(&self) -> &Schema; fn stream_auth(&self) -> Option<&StreamAuthFn>; }`
-  plus a shared config. Move `handle` / `unary` / `json_fetch` / `ws::serve` /
-  `handle_frame` / `run_stream` into a `transport` module generic over `Backend`. The
-  server impls `Backend` over a `Routes` holder; the proxy over a `Channel` holder. After
-  this, a protocol change is written **once** and both surfaces stay byte-identical by
-  construction (which is already a stated goal — "a client can't tell the two apart").
-- **Phase 2 — unify config + schema.** `Schema` moves to core; `ServerConfig` /
-  `ProxyConfig` become thin wrappers over a shared `CoreConfig`.
+- **Phase 1 — the dispatch enum + shared handlers.** ✅ **Done 2026-07-05.** Rather than a
+  generic `Backend` trait (async-trait ergonomics, `Send`/`'static` bounds threaded through
+  the call graph — the "when not to" risk below), an **enum** — there are exactly two
+  backends:
+  ```rust
+  enum Backend { InProcess(tonic::service::Routes), Upstream(tonic::transport::Channel) }
+  impl Backend { async fn call(&self, req: Request<TonicBody>) -> Result<Response<ResBody>, BoxError> { … } }
+  ```
+  The two backends' response bodies differ in type; the `match` in `call` boxes both into
+  one `ResBody`, so everything downstream is monomorphic — no generics, no async-trait. The
+  Fetch (`handle`/`unary`/`json_fetch`) and WebSocket (`serve`/`handle_frame`/`run_stream`)
+  handlers now live once in the crate and dispatch through `Backend::call`; `run_stream`
+  uses `Backend::call` + a shared `Deframer` for both surfaces (the proxy dropped its
+  `client::Grpc`/`BytesCodec` path). A protocol change is now written **once**.
+- **Phase 2 — one crate.** ✅ **Done 2026-07-05.** `grpc-webnext-server`,
+  `grpc-webnext-proxy`, the transitional `grpc-webnext-transport`, and `grpc-webnext-core`
+  are **collapsed into a single `grpc-webnext` crate** (library + proxy binary), published
+  as one. Two entry points build one internal `Runtime` over the shared handlers:
+  `serve_in_process(routes, ServerConfig)` and `serve_proxy(ProxyConfig)` (plus
+  `bind_and_serve_*`). `Schema` gained `from_transcoder` for the in-process case (a static
+  transcoder, no channel); reflection stays proxy-only. The full server + proxy test suites
+  moved into the crate (`tests/inproc_*` + `tests/proxy_*`) — 90 tests, all green.
 
-## When *not* to do this
+## Outcome (the "when not to" risk did not materialize)
 
-If Phase 1's generic bounds turn out to leak (e.g. the two backends' response bodies can't
-be unified without boxing on a hot path, or async-trait `Send` bounds infect the whole
-call graph), stop after Phase 0. Phase 0 alone removes the highest-drift code (the WS frame
-codec and keepalive helpers) at zero risk and is worth doing regardless. But the recurring
-correctness bugs from the split argue for at least reaching Phase 1.
+The enum sidestepped the generic/async-trait friction the trait approach would have hit, so
+there was no reason to stop early. One deliberate **behavior consolidation** fell out: the
+WebSocket handshake now uniformly rejects a blank codec subprotocol on a main endpoint
+unless `allow_implicit_codec` (the documented server behavior) — the proxy's old lenient
+"blank ⇒ binary" default is gone. Net: ~1000 fewer lines, and the four divergences that
+kept recurring (see `STATUS.md`) can no longer happen — the code that produced them is now
+written once.

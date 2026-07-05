@@ -1,5 +1,12 @@
 # Protocol conformance status
 
+> **Note (2026-07-05):** the `grpc-webnext-core`, `-server`, `-proxy`, and `-transport`
+> crates were unified into a single `grpc-webnext` crate (library + proxy binary) — see
+> `doc/UNIFICATION.md`. Dated entries below cite the pre-unification paths
+> (`crates/server/…`, `crates/proxy/…`, `crates/core/…`); those files now live under
+> `crates/grpc-webnext/src/` (the two `ws.rs`/`lib.rs` pairs became `ws.rs` + `fetch.rs`),
+> and the migrated tests under `crates/grpc-webnext/tests/{inproc,proxy}_*.rs`.
+
 Audit of `PROTOCOL.md` against the implementation and test suites (2026-07-03).
 Verdict: the doc is largely accurate — routing rules, close codes, frame shapes,
 transcoding, and the auth handshake all match the code, with solid coverage on the

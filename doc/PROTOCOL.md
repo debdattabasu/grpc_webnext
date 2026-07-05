@@ -116,7 +116,7 @@ Supported subset: verbs `get/put/post/delete/patch` + `custom`; `additional_bind
 path templates with literal segments, `{field}`/`{field=*}` single-segment captures,
 `{field=**}` rest-captures, and dotted field paths; `body: "*"` / `body: "<field>"` /
 none; query-param binding to scalar/repeated fields. Not yet: `response_body`, regex
-path patterns, non-scalar query binding (see `crates/core/src/httprule.rs`).
+path patterns, non-scalar query binding (see `crates/grpc-webnext/src/httprule.rs`).
 
 ## Streaming — WebSocket
 
@@ -177,7 +177,7 @@ a leading `Subscribe` whose `method` is ignored (taken from the URL).
 
 Streams are assigned round-robin across a client-side pool. A second `Subscribe` on a
 non-`multi` connection is impossible (the frames carry no method); the wire otherwise
-matches single-stream with `streamId` added. See `crates/core/src/json_frame.rs`.
+matches single-stream with `streamId` added. See `crates/grpc-webnext/src/json_frame.rs`.
 
 **One message per frame, no fragmentation** (both codecs).
 
@@ -329,8 +329,9 @@ The frame kind is chosen by which field is present, in priority order
   JSON Fetch path. The `+proto` paths carry status in a protobuf `Trailer`, so no header
   encoding applies there.
 - **WebSocket close reasons** truncate to **123 bytes** on a UTF-8 char boundary
-  (WebSocket caps the reason at 123 bytes). Native server only — the proxy has no
-  close-code path.
+  (WebSocket caps the reason at 123 bytes). Applies to both modes — the `4000 + code` close
+  is sent for any handshake-time rejection (missing codec subprotocol, or an in-process
+  connect-auth failure).
 - **`bearer.<token>` subprotocol**: "token-safe" means RFC 7230 token chars (`tchar`). The
   client strips a case-insensitive `Bearer ` scheme, then offers a **lowercase**
   `bearer.<token>` subprotocol only if the remaining token is token-safe (otherwise the
@@ -352,21 +353,25 @@ reached**, then round-robins streams across the pool (`poolSize` defaults to 1, 
   For a non-wildcard body, a query param naming a field already set by a path var is
   skipped.
 
-## Proxy vs native library: what needs schemas
+## In-process vs proxy: what needs schemas
 
-The proxy always parses the WebSocket `Frame` envelope (stream_id, method, headers,
-frame kind) — that is the protocol. Whether it must decode the **application payload**
-depends on the codec:
+grpc-webnext ships as **one crate** with two entry points over identical inbound handling:
+`serve_in_process` wraps a local `tonic::service::Routes` (you own the service);
+`serve_proxy` fronts a remote upstream over a `Channel`. Internally the only difference is
+a `Backend` enum (`InProcess` / `Upstream`) — both are `Service::oneshot(request)` — so a
+client can't tell a wrapped response from a proxied one. Either mode always parses the
+WebSocket `Frame` envelope (stream_id, method, headers, frame kind) — that is the protocol.
+Whether it must decode the **application payload** depends on the codec:
 
 - `+proto` upstream `application/grpc` — payload forwarded **opaquely**, no schema. The
-  proxy stays fully schema-agnostic here, fronting any gRPC server (Go, Java, …) with
+  proxy mode stays fully schema-agnostic here, fronting any gRPC server (Go, Java, …) with
   zero `.proto` knowledge.
-- `+json` (and REST) — needs message descriptors to transcode JSON ↔ protobuf. The proxy
-  **terminates** these: JSON request → binary protobuf upstream, binary response → JSON
-  back, reusing the same core `Transcoder` as the native server so a client can't tell
-  the two surfaces apart.
+- `+json` (and REST) — needs message descriptors to transcode JSON ↔ protobuf. Both modes
+  **terminate** these: JSON request → binary protobuf, binary response → JSON back, via the
+  same `Transcoder`, so the two modes are byte-identical.
 
-Descriptors come from a configurable **schema source** (`ProxyConfig::schema`):
+The in-process mode gets its transcoder directly (`ServerConfig::transcoder`); the proxy
+mode gets it from a configurable **schema source** (`ProxyConfig::schema`):
 
 | `SchemaSource` | Descriptors from |
 |---|---|
@@ -383,9 +388,9 @@ the **raw** descriptor bytes verbatim so custom options (e.g. `google.api.http`)
 but the upstream's reflection must itself preserve them; tonic-reflection currently strips
 custom options ([grpc/grpc-rust#2719](https://github.com/grpc/grpc-rust/issues/2719), see
 `doc/BACKLOG.md`), so REST-over-reflection against a tonic upstream needs a bundled set.
-With `None`, `+json`/REST return `UNIMPLEMENTED` as a proper status-in-header (Fetch) /
-`Trailer` frame (WS) — never an HTTP 501 (that surface exists only on the native server;
-see "Limits & error surfaces").
+With `None` (or, in-process, no `transcoder`), `+json`/REST return `UNIMPLEMENTED` as a
+proper status-in-header (Fetch) / `Reset` frame (WS) — never an HTTP 501, on either mode
+(see "Limits & error surfaces").
 
 ## Reserved for later (not in v1)
 
