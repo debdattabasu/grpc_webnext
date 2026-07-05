@@ -324,8 +324,13 @@ async fn handle(
         // All JSON forms route through the REST matcher first. `+json` is the SDK
         // JSON contract (always allowed on a main path); plain JSON is flag-gated.
         if config.transcoder.is_none() {
-            return Ok(text_response(
-                StatusCode::NOT_IMPLEMENTED,
+            // No transcoder configured: answer with a gRPC status in the JSON headers
+            // (matching the proxy), not an HTTP 501 — the JSON codec always carries
+            // status in `grpc-status`.
+            let resp_ct = if content_type == CT_JSON { CT_JSON } else { "application/json" };
+            return Ok(webnext_error(
+                resp_ct,
+                Code::Unimplemented,
                 "JSON requires a transcoder (ServerConfig::transcoder)",
             ));
         }
@@ -351,13 +356,17 @@ async fn json_fetch(
     sdk_json: bool,
 ) -> Response<ResBody> {
     let tc = config.transcoder.clone().expect("json_fetch requires a transcoder");
+    // The JSON codec always carries status in headers, so a size/transcode rejection is a
+    // status-in-header response (grpc-status in a 200), not an HTTP 413 — mirroring the
+    // proxy so the two `+json` surfaces are indistinguishable.
+    let resp_ct = if sdk_json { CT_JSON } else { "application/json" };
     let (parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return text_response(StatusCode::BAD_REQUEST, format!("read body: {e}")),
     };
     if body_bytes.len() > config.max_message_bytes {
-        return text_response(StatusCode::PAYLOAD_TOO_LARGE, "request message exceeds size limit");
+        return webnext_error(resp_ct, Code::ResourceExhausted, "request message exceeds size limit");
     }
     let path = parts.uri.path().to_string();
     let query = parts.uri.query();
@@ -376,7 +385,6 @@ async fn json_fetch(
     }
 
     // 2) Main gRPC path. `+json` is the SDK contract; plain JSON needs the flag.
-    let resp_ct = if sdk_json { CT_JSON } else { "application/json" };
     if !sdk_json && !config.allow_implicit_codec {
         return text_response(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,

@@ -93,8 +93,10 @@ The native server compiles these bindings from the descriptor set (the same
 `(method, path)` onto the gRPC method — binding path segments, query params, and
 the body into the request message, and returning the response as JSON. So
 `GET /v1/users/123` and `POST /v1/users {…}` both reach `GetUser`. These annotated
-endpoints accept only plain HTTP (no content-type or `application/json`), never the
-grpc-webnext content-types. A plain request whose URL matches no binding is a direct
+endpoints are **JSON-only**: they accept plain HTTP (blank / `application/json`) *and*
+`grpc-webnext+json` — all three transcode through the same path — but reject `+proto`
+with **415** (`"REST-annotated endpoints are JSON-only"`), since binary framing doesn't
+fit the REST surface. A plain request whose URL matches no binding is a direct
 main-endpoint call, which requires `allow_implicit_codec` (else 415).
 
 **Streaming methods** can be annotated too — the annotation URL is then a **WebSocket**
@@ -252,19 +254,138 @@ single-stream note above). Either way the server ignores the wire value and uses
 round-robin). This is not part of the wire format beyond the subprotocol — the server
 only ever sees streams arriving on connections. See `COMPATIBILITY.md`.
 
+## Limits & error surfaces (wire-observable)
+
+The happy paths above are the contract; these are the rejection and limit branches a
+non-conforming or oversized client will actually hit. Where the native server and the
+proxy differ, both are called out — those differences are wire-observable.
+
+### Message size limits (`max_message_bytes`, default 4 MiB)
+
+- **Fetch `+proto`** (server and proxy): only the 4-byte length prefix is read; if the
+  *declared* length exceeds the limit → **HTTP 413** with a plain-text body
+  `"request message exceeds size limit"`. Nothing is buffered to measure.
+- **Fetch `+json`** (server and proxy): the oversized body is rejected with
+  **`RESOURCE_EXHAUSTED` in the `grpc-status` header** (HTTP 200) — *not* an HTTP 413. The
+  JSON codec always carries status in the header, so both surfaces answer identically.
+- **WebSocket** (server and proxy): an inbound message whose payload exceeds the limit
+  (including a `Subscribe`'s inline `initial_payload`) terminates that stream with a
+  `Reset{RESOURCE_EXHAUSTED, "request message exceeds size limit"}`; the connection and its
+  other streams keep running. The transport's own frame limits (tungstenite's defaults)
+  are a coarser backstop above that.
+
+### Stream-level errors — in-band frames (WebSocket)
+
+These arrive as ordinary frames on an already-open connection (not close codes):
+
+- **Duplicate `stream_id`** in a `Subscribe` → `Reset{INVALID_ARGUMENT, "stream_id already
+  in use"}` (server and proxy).
+- **`+json` with no transcoder/schema** → `Reset{UNIMPLEMENTED}` (server and proxy) — a
+  pre-RPC capability rejection, so a `Reset`, not a terminal `Trailer`. (The message
+  differs: the server says `"+json needs a transcoder"`, the proxy explains it's
+  binary-only.)
+- **Too many concurrent streams** — proxy only (`max_concurrent_streams`, default 100) →
+  `Reset{RESOURCE_EXHAUSTED, "too many concurrent streams"}`. The native server has no
+  per-connection stream cap.
+
+The split between the two frame kinds is a **convention** worth stating: a `Reset` carries
+a status for a stream rejected *before or outside* the RPC lifecycle (bad/oversized frame,
+duplicate id, missing capability, auth failure, client cancel); a `Trailer` carries the
+*terminal gRPC status of an RPC that reached the router/upstream* (normal completion or an
+error status it returned). Both render to the same `{status}` JSON frame, so on a JSON
+connection the distinction is invisible; it's observable only on a binary connection.
+
+The `4000 + code` **close code** is used only for **connection-level** rejections at the
+handshake (missing codec subprotocol → `4012`; auth-gate reject → `4016`), never for these
+per-stream errors on an open connection.
+
+### Fetch error surfaces (no transcoder)
+
+- `+json`/JSON with **no** transcoder/schema configured → **`UNIMPLEMENTED` in the
+  `grpc-status` header** (HTTP 200) on both the native server (no `ServerConfig::transcoder`)
+  and the proxy (`SchemaSource::None`) — *not* an HTTP 501. With a transcoder present but the
+  *method* unknown → likewise HTTP 200 + `grpc-status: 12`.
+- Unknown content-type → **415**; `+proto` on a REST-annotated URL → **415**.
+
+### JSON frame edge semantics (`json_frame_to_proto`)
+
+The frame kind is chosen by which field is present, in priority order
+`method` → `status` → `halfClose` → `message` → *(none)*. Consequences:
+
+- A frame with **no recognized field** (`{}`, or a mistyped field name) decodes as a
+  **half-close** — a typo silently ends the send side.
+- A multi-mode **open may combine** `{streamId, method, message}` in one frame: `message`
+  becomes the `Subscribe`'s initial payload (open + first data together). A single-stream
+  open frame carrying `message` does the same.
+- Because `halfClose` outranks `message`, a frame carrying **both** ends the stream and
+  drops the message.
+- **Binary (`-bin`) metadata is dropped** crossing into the JSON codec — JSON frames carry
+  ASCII metadata only.
+
+### Encoding details
+
+- **`grpc-message`** header values are **percent-encoded** — ASCII alphanumerics plus
+  `` (space) `-` `_` `.` `/` `:` `` pass through, everything else becomes `%XX` — on the
+  JSON Fetch path. The `+proto` paths carry status in a protobuf `Trailer`, so no header
+  encoding applies there.
+- **WebSocket close reasons** truncate to **123 bytes** on a UTF-8 char boundary
+  (WebSocket caps the reason at 123 bytes). Native server only — the proxy has no
+  close-code path.
+- **`bearer.<token>` subprotocol**: "token-safe" means RFC 7230 token chars (`tchar`). The
+  client strips a case-insensitive `Bearer ` scheme, then offers a **lowercase**
+  `bearer.<token>` subprotocol only if the remaining token is token-safe (otherwise the
+  credential just flows in the frame). The server matches the lowercase `bearer.` prefix
+  **case-sensitively**.
+
+### Multiplex pool ramp-up (client)
+
+In `+multi` mode the client opens a **new WebSocket per stream until `poolSize` is
+reached**, then round-robins streams across the pool (`poolSize` defaults to 1, clamped
+≥ 1). Single-stream mode is always one socket per stream (no pool). The "round-robin" in
+*Multiplexing* above describes steady state; the ramp-up is per-stream socket creation.
+
+### REST binding precedence
+
+- **Path variables** always overlay the message (applied unconditionally).
+- **Query parameters** bind only when `body` is **not** `"*"`. With `body: "*"` (the whole
+  body *is* the message) query params are **ignored entirely**; path vars still overlay.
+  For a non-wildcard body, a query param naming a field already set by a path var is
+  skipped.
+
 ## Proxy vs native library: what needs schemas
 
 The proxy always parses the WebSocket `Frame` envelope (stream_id, method, headers,
 frame kind) — that is the protocol. Whether it must decode the **application payload**
 depends on the codec:
 
-- `+proto` upstream `application/grpc` — payload forwarded **opaquely**, no schema.
-- `+json` — would require message descriptors to transcode JSON ↔ protobuf.
+- `+proto` upstream `application/grpc` — payload forwarded **opaquely**, no schema. The
+  proxy stays fully schema-agnostic here, fronting any gRPC server (Go, Java, …) with
+  zero `.proto` knowledge.
+- `+json` (and REST) — needs message descriptors to transcode JSON ↔ protobuf. The proxy
+  **terminates** these: JSON request → binary protobuf upstream, binary response → JSON
+  back, reusing the same core `Transcoder` as the native server so a client can't tell
+  the two surfaces apart.
 
-**v1 decision:** the proxy is **binary-only**. It forwards `+proto` opaquely and rejects
-`+json` with `UNIMPLEMENTED`. JSON is served by the native library, which already has the
-message descriptors in-process. This keeps the proxy fully schema-agnostic and able to
-front any gRPC server (Go, Java, …) with zero `.proto` knowledge.
+Descriptors come from a configurable **schema source** (`ProxyConfig::schema`):
+
+| `SchemaSource` | Descriptors from |
+|---|---|
+| `None` (default) | — `+json`/REST answer `UNIMPLEMENTED` |
+| `Reflection` | upstream gRPC server reflection (v1, `v1alpha` fallback) |
+| `Bundled(fds)` | a bundled `FileDescriptorSet` |
+| `ReflectionOrBundled(fds)` | reflection, with the bundle as an immediate fallback |
+
+Reflection is loaded **eagerly and whole** at startup — `list_services` plus each
+service's transitive file closure, assembled into one snapshot — and refreshed on a TTL
+(`reflection_ttl`, default 4h); an optional `admin_reload_path` (`POST`) forces an
+immediate reload. Requests block (bounded) only for the very first load. The proxy frames
+the **raw** descriptor bytes verbatim so custom options (e.g. `google.api.http`) survive —
+but the upstream's reflection must itself preserve them; tonic-reflection currently strips
+custom options ([grpc/grpc-rust#2719](https://github.com/grpc/grpc-rust/issues/2719), see
+`doc/BACKLOG.md`), so REST-over-reflection against a tonic upstream needs a bundled set.
+With `None`, `+json`/REST return `UNIMPLEMENTED` as a proper status-in-header (Fetch) /
+`Trailer` frame (WS) — never an HTTP 501 (that surface exists only on the native server;
+see "Limits & error surfaces").
 
 ## Reserved for later (not in v1)
 

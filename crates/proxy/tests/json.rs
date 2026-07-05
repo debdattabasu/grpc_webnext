@@ -25,6 +25,19 @@ async fn proxy_over(upstream: SocketAddr, schema: SchemaSource) -> String {
     format!("http://{proxy_addr}")
 }
 
+/// Start a proxy with a small message-size limit, to exercise the size guard.
+async fn proxy_over_limit(upstream: SocketAddr, schema: SchemaSource, max_message_bytes: usize) -> String {
+    let (proxy_addr, _handle) = bind_and_serve(ProxyConfig {
+        upstream: format!("http://{upstream}").parse().unwrap(),
+        max_message_bytes,
+        schema,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    format!("http://{proxy_addr}")
+}
+
 /// An Echo upstream that also serves gRPC reflection. Uses testecho's raw-preserving
 /// reflection service (annotations intact) rather than tonic-reflection, which strips
 /// custom options like `google.api.http`.
@@ -244,6 +257,28 @@ async fn ws_streaming_bundled() {
 async fn ws_streaming_reflection() {
     let base = proxy_over(spawn_reflection_upstream().await, SchemaSource::Reflection).await;
     ws_streaming_case(&base).await;
+}
+
+#[tokio::test]
+async fn ws_json_over_size_is_resource_exhausted() {
+    // A WebSocket message larger than max_message_bytes resets the stream with
+    // RESOURCE_EXHAUSTED — the WS analogue of the Fetch size limit (previously WS
+    // enforced no limit at all).
+    let base = proxy_over_limit(
+        testecho::spawn().await,
+        SchemaSource::Bundled(testecho::FILE_DESCRIPTOR_SET.into()),
+        128,
+    )
+    .await;
+    let mut ws = connect_json_ws(&base, "/echo.v1.Echo/Stream").await;
+    // Open with a small message, then send an oversized one.
+    let open = JsonFrame { message: Some(json!({"message": "ok"})), ..Default::default() };
+    ws.send(TungMessage::Text(encode_json_frame(&open).into())).await.unwrap();
+    let big = JsonFrame { message: Some(json!({"message": "a".repeat(4096)})), ..Default::default() };
+    ws.send(TungMessage::Text(encode_json_frame(&big).into())).await.unwrap();
+
+    let (_echoed, status) = collect_ws_json(&mut ws).await;
+    assert_eq!(status, Some(tonic::Code::ResourceExhausted as u32));
 }
 
 /// Collect message strings + terminal status from a JSON WebSocket.

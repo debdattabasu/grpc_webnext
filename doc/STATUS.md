@@ -6,9 +6,16 @@ transcoding, and the auth handshake all match the code, with solid coverage on t
 happy paths. Three real behavioral drifts, one internal doc contradiction, and a
 cluster of test gaps concentrated in the httprule subset and the proxy's JSON
 handling. Drift 2 (client close-code reconstruction) and drift 3 (keepalive) are
-fixed as of 2026-07-04. Drift 1 is resolved as of 2026-07-05 — but by *implementing*
-proxy `+json` (transcoding), not by rejecting it, so PROTOCOL.md's "the v1 proxy
-rejects `+json`" claim is now the stale side and needs updating.
+fixed as of 2026-07-04. Drift 1 is resolved as of 2026-07-05 — by *implementing*
+proxy `+json` (transcoding), not by rejecting it. As of 2026-07-05 PROTOCOL.md is
+reconciled: the stale "v1 proxy rejects `+json`" section is rewritten, the internal
+contradiction is fixed, and every previously-undocumented wire-observable behavior
+is now written up under "Limits & error surfaces". Verifying those behaviors against
+the code turned up four **proxy/native-server divergences**, all **harmonized in code as
+of 2026-07-05** — see "Divergences to reconcile" below. That they kept appearing is itself
+a signal: the proxy and native-server WS/JSON paths are near-duplicate code that drifts
+independently — audited in `doc/UNIFICATION.md`, which finds the split is not structural
+(both backends are a `tower::Service`) and proposes a phased merge.
 
 ## Drift: doc says X, code does Y
 
@@ -49,7 +56,10 @@ reflection to preserve custom options — the proxy frames raw descriptor bytes 
 survive, but tonic-reflection strips `google.api.http` (Go/Java/C++ don't); bundled
 descriptors always carry them. See BACKLOG.md.
 
-Follow-up: update PROTOCOL.md — the "v1 proxy rejects `+json`" line is now stale.
+Follow-up: ~~update PROTOCOL.md — the "v1 proxy rejects `+json`" line is now stale.~~
+**Done 2026-07-05** — the "Proxy vs native library" section now documents `+json`/REST
+termination, the `SchemaSource` table, eager reflection + TTL + reload, and the
+raw-descriptor / tonic-reflection caveat.
 
 ### 2. The client never reconstructs a `Status` from the close frame — RESOLVED (2026-07-04)
 
@@ -135,15 +145,17 @@ ping with a pong. Changes:
   Reset (WS) / `grpc-status` (Fetch) carries whatever `Status` the hook returns —
   any code, e.g. `PERMISSION_DENIED` for a valid-but-unauthorized token.
 
-## Internal doc contradiction
+## Internal doc contradiction — RESOLVED (2026-07-05)
 
-The content-type table says `grpc-webnext+json` also works on annotated REST
-endpoints; the REST section says annotated endpoints accept "never the
+The content-type table said `grpc-webnext+json` also works on annotated REST
+endpoints; the REST section said annotated endpoints accept "never the
 grpc-webnext content-types". The code implements the table's version — all
 JSON-ish content types route through the same transcode-first path
 (`crates/server/src/lib.rs:351-357`), with a test asserting `+json` transcodes
 on a REST URL (`crates/server/tests/json.rs:192`). Only `+proto` is rejected on
-annotated URLs. The REST-section sentence is stale.
+annotated URLs (415, `"REST-annotated endpoints are JSON-only"`). Fixed: the
+REST-section sentence now says annotated endpoints are JSON-only — plain HTTP
+*and* `+json`, rejecting only `+proto`.
 
 ## Improvements
 
@@ -192,30 +204,68 @@ annotated URLs. The REST-section sentence is stale.
   leaving only the one unavoidable envelope-serialize per outbound message. Rust-only —
   no wire or TS change (all suites still pass).
 
-## Undocumented wire-observable behavior
+## Undocumented wire-observable behavior — DOCUMENTED (2026-07-05)
 
-- **Request-size limit → 413** (`max_message_bytes`, native server and proxy).
-  The doc only mentions the client's response-buffer limit.
+All of the below now live in PROTOCOL.md under **"Limits & error surfaces
+(wire-observable)"** (plus the REST-precedence bullets in the REST section).
+Verification against current code corrected several of these from their first
+draft — the corrections are folded in here and in the doc.
+
+- **Request-size limit** (`max_message_bytes`, default 4 MiB). Fetch `+proto` (server +
+  proxy) → HTTP **413**; Fetch `+json` (server + proxy) → **`grpc-status: 8` in a 200**
+  (harmonized 2026-07-05); WebSocket (server + proxy) → `Reset{RESOURCE_EXHAUSTED}` per
+  stream (added 2026-07-05). See PROTOCOL.md "Limits & error surfaces".
 - ~~Proxy unary retry policy~~ — **removed 2026-07-04.** Retry belongs in the
   client, not a wire proxy (retry storms; see the Improvements section and
   `doc/BACKLOG.md`). Removing it also unblocked proxy response streaming.
-- **Stream-level error cases**: duplicate `stream_id` in a Subscribe →
-  `Reset{INVALID_ARGUMENT, "stream_id in use"}`; `+json` without a transcoder →
-  `Reset{UNIMPLEMENTED}` on WS but HTTP `501` on Fetch; exceeding the proxy's
-  `max_concurrent_streams` → `Reset{RESOURCE_EXHAUSTED}`.
-- **JSON frame edge semantics**: a frame with no recognized field (e.g. `{}`)
-  decodes as a half-close — a typo'd field name silently ends the send side. A
-  multi-mode open may combine `{streamId, method, message}` in one frame
-  (message becomes the initial payload). `-bin` metadata is silently dropped
-  crossing into the JSON codec.
-- **Encoding details**: `grpc-message` headers are percent-encoded; close
-  reasons truncate to 123 bytes on a UTF-8 boundary; "token-safe" for
-  `bearer.<token>` means RFC 7230 token chars, embedded raw, matched against a
-  case-sensitive lowercase `bearer.` prefix.
-- **Pool behavior**: the client opens a new socket per stream until `poolSize`
-  is reached, then round-robins — the doc describes steady state only.
+- **Stream-level error cases** (in-band frames, not close codes): duplicate
+  `stream_id` → `Reset{INVALID_ARGUMENT, "stream_id already in use"}`; `+json` without a
+  transcoder → `grpc-status: 12` in a 200 on **Fetch** and `Reset{UNIMPLEMENTED}` on **WS**
+  (both surfaces, harmonized 2026-07-05); exceeding the **proxy's** `max_concurrent_streams`
+  → `Reset{RESOURCE_EXHAUSTED}` (server has no cap).
+- **JSON frame edge semantics**: field-presence priority is
+  `method`→`status`→`halfClose`→`message`→none, so a frame with no recognized
+  field (e.g. `{}`) decodes as a half-close (a typo'd field name silently ends the
+  send side), and a frame with both `halfClose` and `message` drops the message. A
+  multi-mode open may combine `{streamId, method, message}` (message becomes the
+  initial payload). `-bin` metadata is silently dropped crossing into the JSON codec.
+- **Encoding details**: `grpc-message` headers are percent-encoded (alnum + space
+  `-_./:` pass, else `%XX`) on the JSON Fetch path only; close reasons truncate to
+  123 bytes on a UTF-8 boundary (native server only — the proxy has no close path);
+  "token-safe" for `bearer.<token>` means RFC 7230 token chars, embedded raw,
+  matched against a case-sensitive lowercase `bearer.` prefix.
+- **Pool behavior**: in `+multi` mode the client opens a new socket per stream until
+  `poolSize` is reached, then round-robins — the doc described steady state only.
 - **Query params are ignored when `body: "*"`** in REST transcoding; path vars
   still overlay.
+
+## Divergences to reconcile (code, not doc)
+
+Verifying the undocumented behaviors surfaced four places where the **proxy and native
+server disagreed** on a wire-observable rejection. Three are harmonized in code as of
+2026-07-05 (proxy's status-in-header behavior chosen as canonical for `+json`); one
+minor one remains.
+
+1. **WS ignored `max_message_bytes`.** ✅ **Fixed 2026-07-05** — both
+   `crates/server/src/ws.rs` and `crates/proxy/src/ws.rs` now reject an inbound message
+   (or a `Subscribe`'s inline `initial_payload`) over the limit with
+   `Reset{RESOURCE_EXHAUSTED, "request message exceeds size limit"}`, terminating just that
+   stream (the connection and its other streams continue). tungstenite's frame defaults
+   remain a coarser transport backstop. Covered by `ws_json_over_size_is_reset` (server) /
+   `ws_json_over_size_is_resource_exhausted` (proxy).
+2. **Fetch `+json` over-size.** ✅ **Fixed 2026-07-05** — the native server now returns
+   `RESOURCE_EXHAUSTED` in the `grpc-status` header (HTTP 200), matching the proxy, instead
+   of HTTP 413 (`+proto` still uses 413 on both — it's a pre-framing check and they already
+   agreed). Covered by `fetch_json_over_size_is_resource_exhausted` (server).
+3. **Fetch `+json` with no transcoder/schema.** ✅ **Fixed 2026-07-05** — the native server
+   now returns `UNIMPLEMENTED` in the `grpc-status` header (HTTP 200), matching the proxy,
+   instead of HTTP 501. Covered by `fetch_json_without_transcoder_is_unimplemented` (server).
+4. **`+json`-without-schema WS frame kind.** ✅ **Fixed 2026-07-05** — the proxy now sends a
+   `Reset` for a capability-gap rejection (matching the server), reserving `Trailer` for
+   statuses the upstream RPC actually returned; the duplicate-`stream_id` message is unified
+   to `"stream_id already in use"` on both. This is wire-invisible on JSON (both render to
+   `{status}`) but makes the Reset-vs-Trailer convention consistent across the two crates —
+   see PROTOCOL.md "Limits & error surfaces". The convention itself is now documented there.
 
 ## Test coverage gaps
 

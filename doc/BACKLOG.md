@@ -54,6 +54,8 @@ connection/semantics details are still stubbed:
   reflection to preserve custom options — the proxy frames raw descriptor bytes verbatim
   so options survive, but tonic-reflection round-trips through prost and strips
   `google.api.http` (Go/Java/C++ preserve it). Bundled descriptors always carry them.
+  Filed upstream: [grpc/grpc-rust#2719](https://github.com/grpc/grpc-rust/issues/2719)
+  (root cause + proposed fix; PR offered).
 
 ## Native server library
 

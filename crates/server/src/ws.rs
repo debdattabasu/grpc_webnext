@@ -61,6 +61,7 @@ pub async fn serve(
 ) {
     let transcoder = config.transcoder.clone();
     let stream_auth = config.stream_auth.clone();
+    let max_message_bytes = config.max_message_bytes;
     let keepalive = config.ws_keepalive;
     // Max silence tolerated before the peer is declared dead: one ping interval to
     // provoke a pong plus the ack timeout. `None` when keepalive is off.
@@ -154,7 +155,7 @@ pub async fn serve(
                     _ => continue,
                 };
                 let Some((frame, json)) = decoded else { continue };
-                handle_frame(frame, json, multi, &annotation, &routes, &transcoder, &stream_auth, &outbound_tx, &done_tx, &mut streams).await;
+                handle_frame(frame, json, multi, max_message_bytes, &annotation, &routes, &transcoder, &stream_auth, &outbound_tx, &done_tx, &mut streams).await;
             }
         }
     }
@@ -267,11 +268,11 @@ fn truncate_utf8(s: &str, max: usize) -> &str {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     frame: Frame,
     json: bool,
     multi: bool,
+    max_message_bytes: usize,
     annotation: &Option<Arc<WsBinding>>,
     routes: &Routes,
     transcoder: &Option<Arc<Transcoder>>,
@@ -284,7 +285,13 @@ async fn handle_frame(
         Some(Kind::Subscribe(sub)) => {
             let stream_id = sub.stream_id;
             if streams.contains_key(&stream_id) {
-                send_reset(outbound_tx, stream_id, json, multi, Code::InvalidArgument, "stream_id in use").await;
+                send_reset(outbound_tx, stream_id, json, multi, Code::InvalidArgument, "stream_id already in use").await;
+                return;
+            }
+            // An opening frame may carry the first message inline (`initial_payload`);
+            // hold it to the same size limit as any later message.
+            if sub.initial_payload.len() > max_message_bytes {
+                send_reset(outbound_tx, stream_id, json, multi, Code::ResourceExhausted, "request message exceeds size limit").await;
                 return;
             }
             if json && transcoder.is_none() {
@@ -344,6 +351,16 @@ async fn handle_frame(
             streams.insert(stream_id, StreamState { req_tx: req_tx_state, task });
         }
         Some(Kind::Message(msg)) => {
+            if msg.payload.len() > max_message_bytes {
+                // Oversized message terminates the stream (gRPC RESOURCE_EXHAUSTED),
+                // matching the Fetch size limit.
+                let stream_id = msg.stream_id;
+                send_reset(outbound_tx, stream_id, json, multi, Code::ResourceExhausted, "request message exceeds size limit").await;
+                if let Some(state) = streams.remove(&stream_id) {
+                    state.task.abort();
+                }
+                return;
+            }
             if let Some(state) = streams.get(&msg.stream_id) {
                 if let Some(tx) = &state.req_tx {
                     let _ = tx.send(msg.payload).await;

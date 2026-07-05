@@ -50,6 +50,7 @@ pub async fn serve(
     annotation: Option<Arc<WsBinding>>,
     websocket: HyperWebsocket,
     max_streams: usize,
+    max_message_bytes: usize,
     multi: bool,
     json: bool,
     method: Option<String>,
@@ -134,7 +135,7 @@ pub async fn serve(
                     _ => continue,
                 };
                 let Some(frame) = frame else { continue };
-                handle_frame(frame, json, &channel, &schema, &annotation, &outbound_tx, &done_tx, &mut streams, max_streams).await;
+                handle_frame(frame, json, &channel, &schema, &annotation, &outbound_tx, &done_tx, &mut streams, max_streams, max_message_bytes).await;
             }
         }
     }
@@ -210,6 +211,7 @@ async fn handle_frame(
     done_tx: &mpsc::Sender<u32>,
     streams: &mut HashMap<u32, StreamState>,
     max_streams: usize,
+    max_message_bytes: usize,
 ) {
     match frame.kind {
         Some(Kind::Subscribe(sub)) => {
@@ -220,6 +222,12 @@ async fn handle_frame(
             }
             if streams.len() >= max_streams {
                 send_reset(outbound_tx, stream_id, Code::ResourceExhausted, "too many concurrent streams").await;
+                return;
+            }
+            // An opening frame may carry the first message inline (`initial_payload`);
+            // hold it to the same size limit as any later message.
+            if sub.initial_payload.len() > max_message_bytes {
+                send_reset(outbound_tx, stream_id, Code::ResourceExhausted, "request message exceeds size limit").await;
                 return;
             }
             let path: PathAndQuery = match sub.method.parse() {
@@ -266,6 +274,16 @@ async fn handle_frame(
             streams.insert(stream_id, StreamState { req_tx: req_tx_state, task });
         }
         Some(Kind::Message(msg)) => {
+            if msg.payload.len() > max_message_bytes {
+                // Oversized message terminates the stream (gRPC RESOURCE_EXHAUSTED),
+                // matching the Fetch size limit.
+                let stream_id = msg.stream_id;
+                send_reset(outbound_tx, stream_id, Code::ResourceExhausted, "request message exceeds size limit").await;
+                if let Some(state) = streams.remove(&stream_id) {
+                    state.task.abort();
+                }
+                return;
+            }
             if let Some(state) = streams.get(&msg.stream_id) {
                 if let Some(tx) = &state.req_tx {
                     let _ = tx.send(msg.payload).await;
@@ -313,7 +331,10 @@ async fn run_stream(
         match schema.transcoder(&method_path).await {
             Ok(tc) => Some(tc),
             Err(status) => {
-                send_trailer(&outbound_tx, stream_id, &status).await;
+                // Capability gap (no schema / unknown method), rejected before the
+                // upstream RPC starts — a `Reset`, matching the native server's
+                // no-transcoder path. (Upstream-returned statuses below are `Trailer`s.)
+                send_reset(&outbound_tx, stream_id, status.code(), status.message()).await;
                 let _ = done_tx.send(stream_id).await;
                 return;
             }

@@ -224,10 +224,11 @@ impl Proxy {
                     let channel = self.channel.clone();
                     let schema = self.schema.clone();
                     let max_streams = self.config.max_concurrent_streams;
+                    let max_message_bytes = self.config.max_message_bytes;
                     let keepalive = self.config.ws_keepalive;
                     let keepalive_timeout = self.config.ws_keepalive_timeout;
                     tokio::spawn(async move {
-                        ws::serve(channel, schema, annotation, websocket, max_streams, multi, json, method, keepalive, keepalive_timeout).await
+                        ws::serve(channel, schema, annotation, websocket, max_streams, max_message_bytes, multi, json, method, keepalive, keepalive_timeout).await
                     });
                     response.map(boxed_full)
                 }

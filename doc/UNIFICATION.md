@@ -1,0 +1,132 @@
+# Proxy / native-server unification audit
+
+*2026-07-05. Why the proxy and the native server are two near-duplicate codebases,
+whether they need to be, and what it would take to merge them.*
+
+## TL;DR
+
+We do **not** structurally need two codebases. The proxy and the native server already
+share every *wire primitive* (all of `grpc_webnext_core`), and differ in exactly one
+thing: **where the gRPC call goes.** The server dispatches into an in-process
+`tonic::service::Routes`; the proxy forwards to a remote `tonic::transport::Channel`.
+Both are `tower::Service<http::Request, Response = http::Response>` invoked the same way —
+`.oneshot(req)`. Everything wrapped around that one call — WebSocket frame handling, codec
+negotiation, JSON transcoding, keepalive, deadlines, size limits, stream-level errors,
+metadata mapping — is ~70–80% duplicated glue that drifts independently. This session alone
+found and fixed **four** proxy/server divergences (see `STATUS.md`), every one of them a
+copy that fell out of sync. That is the cost of the split, and it will recur.
+
+The fix is to extract the shared translation layer into one module generic over a small
+`Backend` trait, with `Routes` and `Channel` as the two implementations. The blockers below
+are all tractable; none is fundamental.
+
+## Evidence: the two crates are structural twins
+
+Line counts (orchestration glue only — core primitives excluded):
+
+| | `lib.rs` | `ws.rs` | other |
+|---|---|---|---|
+| server | 704 | 513 | — |
+| proxy | 678 | 503 | `schema.rs` 214, `reflect.rs` 253 (both `+json`-only) |
+
+The function inventories line up almost 1:1:
+
+| Responsibility | server | proxy |
+|---|---|---|
+| accept loop | `serve` / `bind_and_serve` | `serve` / `bind_and_serve` |
+| request router | `handle` | `Proxy::handle` |
+| native gRPC forward | `passthrough` | `Proxy::passthrough` |
+| `+proto` unary | `unary` | `handle_unary` |
+| `+json` / REST unary | `json_fetch` → `json_unary_call` | `handle_json_fetch` → `unary_json_upstream` |
+| request-body framing | `frame_upstream_request` | `frame_upstream_request` |
+| JSON Fetch response | `json_fetch_response` / `webnext_error` | `json_fetch_response` / `json_error` / `fetch_status` |
+| WS connection loop | `ws::serve` | `ws::serve` |
+| WS frame decode | `decode_binary` / `decode_text` | `decode_binary` / `decode_text` |
+| WS frame encode | `to_tung` | `to_tung` |
+| WS dispatch | `handle_frame` | `handle_frame` |
+| WS per-stream pump | `run_stream` | `run_stream` |
+| WS reset/trailer | `send_reset` | `send_reset` / `send_trailer` |
+| keepalive helpers | `keepalive_interval` / `next_tick` / `sleep_until` | `keepalive_interval` / `next_tick` / `sleep_until` *(identical)* |
+
+`decode_binary`, `decode_text`, `to_tung`, `keepalive_interval`, `next_tick`,
+`sleep_until`, and `frame_upstream_request` are **character-for-character identical** (or
+differ only in an error-helper name). They are pure copies.
+
+## The one real difference: local dispatch vs remote call
+
+Compare `server::unary` ([lib.rs:525](../crates/server/src/lib.rs#L525)) and
+`proxy::handle_unary` ([lib.rs:307](../crates/proxy/src/lib.rs#L307)). Both:
+
+1. parse the method path,
+2. stream the length-prefixed request body into a gRPC frame (`frame_upstream_request`),
+3. build a gRPC request (forward metadata minus the hop-by-hop denylist, force
+   `application/grpc`, `te: trailers`, forward `grpc-timeout`),
+4. **dispatch**,
+5. map initial metadata → response headers,
+6. stream the message block (drop the 1-byte compression flag) and append the trailer
+   block built from the terminal status — with the same `EMPTY_MESSAGE_BLOCK` fallback for
+   a trailers-only response.
+
+Steps 1–3 and 5–6 are identical. Step 4 is the entire divergence:
+
+```rust
+// server                                  // proxy
+routes.oneshot(grpc_req).await             channel.oneshot(grpc_req).await
+    .unwrap_or_else(|e| match e {})            // fallible: BAD_GATEWAY / Unavailable
+```
+
+`Routes::Error` is `Infallible` (`match e {}`); `Channel::Error` is a transport error. Both
+take an `http::Request<_>` and return an `http::Response<_>`. **That is the whole reason
+there are two codebases** — and it's a difference in one associated type, not in the
+protocol logic.
+
+## Blockers to unification (all tractable)
+
+| # | Blocker | Why it looks fundamental | Actually | Resolution |
+|---|---|---|---|---|
+| 1 | Backend type: `Routes` vs `Channel`; different `Error` + response-`Body` assoc types | "One is a server, one is a client" | Both are `tower::Service<Request<TonicBody>, Response = Response<B>>`; both are already reduced to `.oneshot()` + `.map(\|b\| b.map_err(Into::into).boxed_unsync())` | A `Backend` trait (or a generic bound `S: Service<…, Error: Into<BoxError>>, B: Body<Data = Bytes>`). `Infallible: Into<BoxError>` already holds. |
+| 2 | Transcoder source: server holds `Option<Arc<Transcoder>>` (sync, in-process); proxy holds `Schema` (async: reflection/bundled/TTL/reload) | Reflection machinery is proxy-only | The server's transcoder is a strict **subset** of `Schema` (a permanent `Bundled`/`None`) | Move `Schema` into core; the server uses `Bundled`/`None`. `Schema::transcoder` is already async — a synchronous in-process transcoder is just an always-ready future. `reflect.rs` stays feature-gated to the proxy. |
+| 3 | Auth hooks (`connect_auth`, `stream_auth`) exist only on the server | Proxy has no auth model | The shared layer takes them as `Option<…>`; the proxy passes `None` | Optional fields on the shared config; no logic change. |
+| 4 | Deadline enforcement: proxy runs a local timer + forwards `grpc-timeout + grace`; server delegates to the in-process router | Remote calls need client-side cancellation; local ones don't | Local enforcement is *harmless* for the in-process case (the router also honours the header) | Always enforce locally in the shared path, or gate it with one `Backend` flag (`enforces_own_deadline`). |
+| 5 | Proxy-only knobs: `max_concurrent_streams`, `admin_reload_path`, upstream URI; retry deliberately removed | Proxy-specific policy | These are config values, not protocol | Live on the backend-specific config extension; the shared loop reads `max_streams: Option<usize>` etc. |
+| 6 | `ServerConfig` vs `ProxyConfig` | Two structs | Overlap is `max_message_bytes`, `ws_keepalive`, `ws_keepalive_timeout`, `allow_implicit_codec` | Factor a shared `CoreConfig`; each crate wraps it with its extras. |
+| 7 | Style: server is free fns `(routes, config)`; proxy is `&self` methods on a `Proxy` struct | — | Cosmetic | Pick one (a `Server<B: Backend>` holder reads best). |
+
+Nothing on this list is a design contradiction. #1 is the only one with real Rust friction
+(async-trait ergonomics, body-type erasure, `Send`/`'static` bounds on the generic), and
+even that is a well-trodden pattern (`tower::Service` + `BoxBody`).
+
+## What is already shared (so it is *not* a blocker)
+
+All wire primitives live in `grpc_webnext_core` and are used verbatim by both crates:
+`Transcoder`, `json_frame::{json_frame_to_proto, proto_frame_to_json, json_open_to_subscribe,
+decode_json_frame, encode_json_frame}`, `metadata::*`, `httprule` / `WsBinding`, `Deframer`,
+`BytesCodec`, `decode_frame` / `encode_frame`, `grpc_frame`, and the generated `pb` types.
+The protocol *vocabulary* is unified already; only the *orchestration* is duplicated.
+
+## Proposed path (phased, lowest-risk first)
+
+- **Phase 0 — dedupe the pure copies (no abstraction).** Move the character-identical
+  helpers into core: `decode_binary`, `decode_text`, `to_tung`, `keepalive_interval`,
+  `next_tick`, `sleep_until`, `frame_upstream_request`, `json_fetch_response`, the
+  trailer-block streaming builder, `EMPTY_MESSAGE_BLOCK`, `boxed_full`, `text_response`.
+  Zero behavioral risk, immediate; removes the most drift-prone code (the frame codec and
+  keepalive helpers are exactly where divergences hide). Cuts a few hundred duplicated
+  lines on its own.
+- **Phase 1 — the `Backend` trait + shared handlers.** Define
+  `trait Backend { async fn call(&self, req: Request<TonicBody>) -> Result<Response<BoxBody>, BoxError>; fn schema(&self) -> &Schema; fn stream_auth(&self) -> Option<&StreamAuthFn>; }`
+  plus a shared config. Move `handle` / `unary` / `json_fetch` / `ws::serve` /
+  `handle_frame` / `run_stream` into a `transport` module generic over `Backend`. The
+  server impls `Backend` over a `Routes` holder; the proxy over a `Channel` holder. After
+  this, a protocol change is written **once** and both surfaces stay byte-identical by
+  construction (which is already a stated goal — "a client can't tell the two apart").
+- **Phase 2 — unify config + schema.** `Schema` moves to core; `ServerConfig` /
+  `ProxyConfig` become thin wrappers over a shared `CoreConfig`.
+
+## When *not* to do this
+
+If Phase 1's generic bounds turn out to leak (e.g. the two backends' response bodies can't
+be unified without boxing on a hot path, or async-trait `Send` bounds infect the whole
+call graph), stop after Phase 0. Phase 0 alone removes the highest-drift code (the WS frame
+codec and keepalive helpers) at zero risk and is worth doing regardless. But the recurring
+correctness bugs from the split argue for at least reaching Phase 1.

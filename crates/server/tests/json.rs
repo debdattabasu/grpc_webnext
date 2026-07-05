@@ -53,6 +53,19 @@ async fn start_json_server_impl(allow_implicit_codec: bool) -> String {
     format!("http://{addr}")
 }
 
+/// A `+json` server with a small message-size limit, to exercise the size guard.
+async fn start_json_server_small_limit(max_message_bytes: usize) -> String {
+    let transcoder = Arc::new(Transcoder::from_file_descriptor_set(testecho::FILE_DESCRIPTOR_SET).unwrap());
+    let routes = Routes::new(EchoServer::new(EchoSvc::default()));
+    let (addr, _handle) = bind_and_serve(
+        routes,
+        ServerConfig { transcoder: Some(transcoder), max_message_bytes, ..Default::default() },
+    )
+    .await
+    .unwrap();
+    format!("http://{addr}")
+}
+
 #[tokio::test]
 async fn unary_json_round_trip() {
     let base = start_json_server().await;
@@ -232,6 +245,67 @@ async fn fetch_json_unknown_method_is_unimplemented() {
         .await
         .unwrap();
     assert_eq!(resp.headers().get("grpc-status").unwrap(), "12");
+}
+
+#[tokio::test]
+async fn fetch_json_without_transcoder_is_unimplemented() {
+    // No transcoder configured: `+json` returns UNIMPLEMENTED in the grpc-status header
+    // (HTTP 200), not an HTTP 501 — the JSON codec always carries status in a header,
+    // matching the proxy so the two `+json` surfaces are indistinguishable.
+    let routes = Routes::new(EchoServer::new(EchoSvc::default()));
+    let (addr, _handle) = bind_and_serve(routes, ServerConfig::default()).await.unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/echo.v1.Echo/Unary"))
+        .header("content-type", CT_JSON_STR)
+        .body(r#"{"message":"x"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "12");
+}
+
+#[tokio::test]
+async fn fetch_json_over_size_is_resource_exhausted() {
+    // An oversized `+json` body returns RESOURCE_EXHAUSTED in the header (HTTP 200),
+    // not an HTTP 413 — mirroring the proxy.
+    let base = start_json_server_small_limit(64).await;
+    let big = format!(r#"{{"message":"{}"}}"#, "a".repeat(4096));
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/echo.v1.Echo/Unary"))
+        .header("content-type", CT_JSON_STR)
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("grpc-status").unwrap().to_str().unwrap(),
+        (tonic::Code::ResourceExhausted as u32).to_string(),
+    );
+}
+
+#[tokio::test]
+async fn ws_json_over_size_is_reset() {
+    // A WebSocket message larger than max_message_bytes resets the stream with
+    // RESOURCE_EXHAUSTED (the WS analogue of the Fetch size limit; WS previously
+    // enforced no limit at all).
+    let base = start_json_server_small_limit(128).await;
+    let url = format!("{}/echo.v1.Echo/Stream", base.replacen("http", "ws", 1));
+    let mut ws = ws_connect(&url, Some("grpc-webnext+json")).await;
+    // Open the stream with a small message, then send an oversized one.
+    ws.send(text(serde_json::json!({ "message": {"message": "ok"} }))).await.unwrap();
+    ws.send(text(serde_json::json!({ "message": {"message": "a".repeat(4096)} }))).await.unwrap();
+    let mut code = None;
+    while let Some(msg) = ws.next().await {
+        let TungMessage::Text(t) = msg.unwrap() else { continue };
+        let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
+        if let Some(s) = jf.get("status") {
+            code = s["code"].as_u64();
+            break;
+        }
+    }
+    assert_eq!(code, Some(tonic::Code::ResourceExhausted as u64));
 }
 
 #[tokio::test]
