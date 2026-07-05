@@ -24,15 +24,39 @@ use tonic::service::Routes;
 use tonic::transport::Channel;
 use tonic::Status;
 
+// Inbound protocol translation.
 pub mod backend;
 mod fetch;
 mod reflect;
 pub mod schema;
 mod ws;
 
+// Wire codec + gRPC-semantics core: generated types, frame codec, Fetch-response framing,
+// metadata, HTTP-rule transcoding.
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/grpc.webnext.v1.rs"));
+}
+pub mod codec;
+pub mod frame;
+mod framing;
+pub mod grpc_framing;
+pub mod httprule;
+pub mod json_frame;
+pub mod metadata;
+pub mod transcode;
+
 pub use backend::Backend;
-pub use grpc_webnext_core::Transcoder;
 pub use schema::{Schema, SchemaSource};
+
+pub use codec::BytesCodec;
+pub use frame::{decode_frame, encode_frame, FrameError};
+pub use framing::{
+    decode_response_body, encode_request_body, encode_response_body, encode_trailer_block,
+    FetchError, EMPTY_MESSAGE_BLOCK, LEN_PREFIX,
+};
+pub use grpc_framing::{deframe_all, frame as grpc_frame, Deframer};
+pub use httprule::{HttpCall, HttpRouter, WsBinding};
+pub use transcode::{TranscodeError, Transcoder};
 
 // --- Wire constants ---------------------------------------------------------
 
@@ -277,6 +301,6 @@ pub fn ws_bearer_token(headers: &HeaderMap) -> Option<String> {
 pub(crate) fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        (k == key).then(|| grpc_webnext_core::metadata::percent_decode(v))
+        (k == key).then(|| crate::metadata::percent_decode(v))
     })
 }

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
-use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Message as WsMessage, Subscribe};
-use grpc_webnext_core::{decode_frame, encode_frame, Transcoder};
+use grpc_webnext::pb::{frame::Kind, Frame, HalfClose, Message as WsMessage, Subscribe};
+use grpc_webnext::{decode_frame, encode_frame, Transcoder};
 use grpc_webnext::{bind_and_serve_in_process, ServerConfig, CT_JSON};
 use prost::Message as _;
 use testecho::pb::echo_server::EchoServer;

@@ -1,8 +1,8 @@
 //! Native server: grpc-webnext WebSocket streaming (bidi) into the inner Routes.
 
 use futures::{SinkExt, StreamExt};
-use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Message as WsMessage, Subscribe};
-use grpc_webnext_core::{decode_frame, encode_frame};
+use grpc_webnext::pb::{frame::Kind, Frame, HalfClose, Message as WsMessage, Subscribe};
+use grpc_webnext::{decode_frame, encode_frame};
 use grpc_webnext::{bind_and_serve_in_process, ServerConfig};
 use prost::Message;
 use testecho::pb::echo_server::EchoServer;

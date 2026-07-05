@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use grpc_webnext_core::Transcoder;
+use crate::Transcoder;
 use prost::Message as _;
 use prost_types::FileDescriptorProto;
 use tonic::transport::Channel;

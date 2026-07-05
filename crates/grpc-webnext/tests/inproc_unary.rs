@@ -1,7 +1,7 @@
 //! Native server: same-port native gRPC pass-through + grpc-webnext unary.
 
 use bytes::Bytes;
-use grpc_webnext_core::{decode_response_body, encode_request_body};
+use grpc_webnext::{decode_response_body, encode_request_body};
 use grpc_webnext::{bind_and_serve_in_process, ServerConfig, CT_PROTO};
 use prost::Message;
 use testecho::pb::echo_client::EchoClient;

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use grpc_webnext_core::{TranscodeError, Transcoder};
+use crate::{TranscodeError, Transcoder};
 use tokio::sync::watch;
 use tonic::transport::Channel;
 use tonic::Status;

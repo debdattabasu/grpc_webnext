@@ -8,8 +8,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use grpc_webnext_core::pb::Trailer;
-use grpc_webnext_core::{
+use crate::pb::Trailer;
+use crate::{
     deframe_all, encode_response_body, encode_trailer_block, grpc_frame, metadata, Transcoder,
     EMPTY_MESSAGE_BLOCK, LEN_PREFIX,
 };

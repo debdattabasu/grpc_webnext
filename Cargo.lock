@@ -429,17 +429,20 @@ dependencies = [
  "async-stream",
  "bytes",
  "futures",
- "grpc-webnext-core",
  "http",
  "http-body-util",
  "hyper",
  "hyper-tungstenite",
  "hyper-util",
  "prost",
+ "prost-build",
+ "prost-reflect",
  "prost-types",
  "reqwest",
+ "serde",
  "serde_json",
  "testecho",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
@@ -449,21 +452,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "grpc-webnext-core"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "http",
- "prost",
- "prost-build",
- "prost-reflect",
- "serde",
- "serde_json",
- "thiserror",
- "tonic",
 ]
 
 [[package]]

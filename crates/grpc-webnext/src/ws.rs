@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use grpc_webnext_core::json_frame::{
+use crate::json_frame::{
     decode_json_frame, encode_json_frame, json_frame_to_proto, json_open_to_subscribe,
     proto_frame_to_json,
 };
-use grpc_webnext_core::pb::{frame::Kind, Frame, Header, Message as WsMessage, Reset, Trailer};
-use grpc_webnext_core::{decode_frame, encode_frame, grpc_frame, metadata, Deframer, WsBinding};
+use crate::pb::{frame::Kind, Frame, Header, Message as WsMessage, Reset, Trailer};
+use crate::{decode_frame, encode_frame, grpc_frame, metadata, Deframer, WsBinding};
 use http::uri::PathAndQuery;
 use http::{HeaderMap, Request};
 use http_body_util::{BodyExt, StreamBody};

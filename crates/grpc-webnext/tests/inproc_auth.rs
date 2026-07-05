@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use grpc_webnext_core::pb::{frame::Kind, Frame, Subscribe};
-use grpc_webnext_core::{decode_frame, decode_response_body, encode_frame, encode_request_body};
+use grpc_webnext::pb::{frame::Kind, Frame, Subscribe};
+use grpc_webnext::{decode_frame, decode_response_body, encode_frame, encode_request_body};
 use grpc_webnext::{bind_and_serve_in_process, ws_bearer_token, ServerConfig, CT_PROTO};
 use prost::Message as _;
 use testecho::pb::echo_client::EchoClient;
@@ -38,9 +38,9 @@ async fn connect(url: &str, subprotocol: Option<&str>) -> (Ws, Resp) {
 fn subscribe(stream_id: u32, metadata: &[(&str, &str)]) -> TungMessage {
     let headers = metadata
         .iter()
-        .map(|(k, v)| grpc_webnext_core::pb::Metadatum {
+        .map(|(k, v)| grpc_webnext::pb::Metadatum {
             key: k.to_string(),
-            value: Some(grpc_webnext_core::pb::metadatum::Value::AsciiValue(v.to_string())),
+            value: Some(grpc_webnext::pb::metadatum::Value::AsciiValue(v.to_string())),
         })
         .collect();
     TungMessage::Binary(encode_frame(&Frame {
@@ -57,7 +57,7 @@ fn subscribe(stream_id: u32, metadata: &[(&str, &str)]) -> TungMessage {
 
 fn half_close(stream_id: u32) -> TungMessage {
     TungMessage::Binary(encode_frame(&Frame {
-        kind: Some(Kind::HalfClose(grpc_webnext_core::pb::HalfClose { stream_id })),
+        kind: Some(Kind::HalfClose(grpc_webnext::pb::HalfClose { stream_id })),
     }))
 }
 

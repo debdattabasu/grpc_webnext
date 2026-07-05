@@ -1,7 +1,7 @@
 //! End-to-end: grpc-webnext Fetch unary request -> proxy -> tonic echo server.
 
 use bytes::Bytes;
-use grpc_webnext_core::{decode_response_body, encode_request_body};
+use grpc_webnext::{decode_response_body, encode_request_body};
 use grpc_webnext::{bind_and_serve_proxy, ProxyConfig, CT_PROTO};
 use prost::Message;
 use testecho::pb::{EchoRequest, EchoResponse};

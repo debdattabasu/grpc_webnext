@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use grpc_webnext_core::pb::{frame::Kind, Frame, HalfClose, Reset, Subscribe};
-use grpc_webnext_core::{decode_frame, encode_frame};
+use grpc_webnext::pb::{frame::Kind, Frame, HalfClose, Reset, Subscribe};
+use grpc_webnext::{decode_frame, encode_frame};
 use grpc_webnext::{bind_and_serve_proxy, ProxyConfig};
 use prost::Message;
 use testecho::pb::EchoRequest;

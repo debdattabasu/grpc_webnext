@@ -5,7 +5,7 @@
 //! no-descriptors case.
 
 use futures::{SinkExt, StreamExt};
-use grpc_webnext_core::json_frame::{decode_json_frame, encode_json_frame, JsonFrame};
+use grpc_webnext::json_frame::{decode_json_frame, encode_json_frame, JsonFrame};
 use grpc_webnext::{bind_and_serve_proxy, ProxyConfig, SchemaSource, CT_JSON};
 use serde_json::json;
 use std::net::SocketAddr;
