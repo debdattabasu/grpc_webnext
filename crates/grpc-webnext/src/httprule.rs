@@ -57,6 +57,10 @@ struct Binding {
     input: MessageDescriptor,
 }
 
+/// A captured path variable: the dotted field path it binds to, and its string value —
+/// e.g. `(["user", "id"], "123")` for a `{user.id}` template segment.
+type PathVar = (Vec<String>, String);
+
 /// The transcoded call: which gRPC method to invoke and the encoded request.
 pub struct HttpCall {
     pub grpc_method: String,
@@ -67,7 +71,7 @@ pub struct HttpCall {
 /// the path/query bindings, used to build each streamed request message.
 pub struct WsBinding {
     binding: Binding,
-    vars: Vec<(Vec<String>, String)>,
+    vars: Vec<PathVar>,
     query: Option<String>,
 }
 
@@ -146,7 +150,7 @@ impl HttpRouter {
 
     /// Find a binding matching `(method, path)` and return it plus the captured
     /// path variables (dotted field path -> value).
-    fn match_request(&self, method: &str, path: &str) -> Option<(&Binding, Vec<(Vec<String>, String)>)> {
+    fn match_request(&self, method: &str, path: &str) -> Option<(&Binding, Vec<PathVar>)> {
         let want = method.to_ascii_uppercase();
         for b in &self.bindings {
             if b.http_method != want {
@@ -257,7 +261,7 @@ fn parse_template(template: &str) -> Vec<Segment> {
 }
 
 /// Match a request path against a template, returning captured `(field_path, value)`.
-fn match_segments(segments: &[Segment], path: &str) -> Option<Vec<(Vec<String>, String)>> {
+fn match_segments(segments: &[Segment], path: &str) -> Option<Vec<PathVar>> {
     let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     let mut vars = Vec::new();
     let mut i = 0;
@@ -291,7 +295,7 @@ fn match_segments(segments: &[Segment], path: &str) -> Option<Vec<(Vec<String>, 
 /// Build the encoded request message from a matched binding + inputs.
 fn build_message(
     binding: &Binding,
-    vars: &[(Vec<String>, String)],
+    vars: &[PathVar],
     query: Option<&str>,
     body: &[u8],
 ) -> Result<Vec<u8>, TranscodeError> {

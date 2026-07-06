@@ -20,7 +20,6 @@ use pb::greeter_server::{Greeter, GreeterServer};
 use pb::{ChatMessage, CountdownRequest, HelloReply, HelloRequest, SleepRequest, Tick};
 use tonic::service::Routes;
 
-#[derive(Default)]
 struct GreeterSvc;
 
 #[tonic::async_trait]
@@ -90,7 +89,7 @@ impl Greeter for GreeterSvc {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let routes = Routes::new(GreeterServer::new(GreeterSvc::default()));
+    let routes = Routes::new(GreeterServer::new(GreeterSvc));
     let transcoder = Arc::new(Transcoder::from_file_descriptor_set(FILE_DESCRIPTOR_SET)?);
     let (addr, handle) = bind_and_serve_in_process(
         routes,
