@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grpc-webnext/conformance/case.schema.json",
+  "title": "grpc-webnext conformance case file",
+  "description": "A suite of scenarios run by a client driver against a ConformanceService server. See conformance/README.md.",
+  "type": "object",
+  "required": ["suite", "cases"],
+  "additionalProperties": false,
+  "properties": {
+    "suite": { "type": "string", "description": "Suite name; matches the file stem." },
+    "cases": { "type": "array", "items": { "$ref": "#/$defs/case" }, "minItems": 1 }
+  },
+  "$defs": {
+    "bytes": {
+      "description": "A byte value, given as UTF-8 text or base64.",
+      "type": "object",
+      "oneOf": [
+        { "required": ["text"], "additionalProperties": false, "properties": { "text": { "type": "string" } } },
+        { "required": ["b64"], "additionalProperties": false, "properties": { "b64": { "type": "string" } } }
+      ]
+    },
+    "metadatum": {
+      "type": "object",
+      "required": ["key"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "type": "string" },
+        "ascii": { "type": "string" },
+        "b64": { "type": "string", "description": "For -bin keys; base64 of the binary value." }
+      }
+    },
+    "responseDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status_code": { "type": "integer", "minimum": 0 },
+        "status_message": { "type": "string" },
+        "headers": { "type": "array", "items": { "$ref": "#/$defs/metadatum" } },
+        "trailers": { "type": "array", "items": { "$ref": "#/$defs/metadatum" } },
+        "payload": { "$ref": "#/$defs/bytes" },
+        "stream_messages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "payload": { "$ref": "#/$defs/bytes" }, "delay_ms": { "type": "integer" } }
+          }
+        },
+        "delay_ms": { "type": "integer" },
+        "oversize_response_bytes": { "type": "integer" }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "payload": { "$ref": "#/$defs/bytes" },
+        "response_definition": { "$ref": "#/$defs/responseDefinition" }
+      }
+    },
+    "payloadMatcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "payload": { "$ref": "#/$defs/bytes" },
+        "request_info": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "request_headers_contain": { "type": "array", "items": { "$ref": "#/$defs/metadatum" } },
+            "timeout_present": { "type": "boolean" },
+            "json": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "required": ["name", "rpc", "expect"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "description": "Unique within the suite." },
+        "rpc": { "enum": ["Unary", "ServerStream", "ClientStream", "BidiStream"] },
+        "transports": {
+          "type": "array",
+          "items": { "enum": ["fetch", "websocket"] },
+          "description": "Run the case once per listed transport. Default: Unary -> [fetch, websocket]; streaming -> [websocket]."
+        },
+        "codecs": {
+          "type": "array",
+          "items": { "enum": ["proto", "json"] },
+          "description": "Run the case once per listed codec (cartesian with transports). Default [proto, json]."
+        },
+        "timeout_millis": { "type": "integer", "description": "grpc-timeout the client sets on the call." },
+        "request_metadata": { "type": "array", "items": { "$ref": "#/$defs/metadatum" }, "description": "Request headers the driver attaches to the call." },
+        "requires": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Server config profile this case needs (e.g. max_message_bytes, transcoder). The harness selects a matching server; an unsatisfiable profile marks the case SKIPPED."
+        },
+        "request": { "$ref": "#/$defs/message", "description": "Unary / single request." },
+        "requests": { "type": "array", "items": { "$ref": "#/$defs/message" }, "description": "ClientStream / BidiStream inbound messages." },
+        "cancel_after_messages": { "type": "integer", "description": "Client resets/cancels the stream after receiving N messages (drives Reset propagation)." },
+        "expect": {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "type": "object",
+              "required": ["code"],
+              "additionalProperties": false,
+              "properties": { "code": { "type": "integer" }, "message_contains": { "type": "string" } }
+            },
+            "response": { "$ref": "#/$defs/payloadMatcher" },
+            "messages": { "type": "array", "items": { "$ref": "#/$defs/payloadMatcher" } },
+            "message_count": { "type": "integer" },
+            "headers_contain": { "type": "array", "items": { "$ref": "#/$defs/metadatum" } },
+            "trailers_contain": { "type": "array", "items": { "$ref": "#/$defs/metadatum" } }
+          }
+        }
+      }
+    }
+  }
+}

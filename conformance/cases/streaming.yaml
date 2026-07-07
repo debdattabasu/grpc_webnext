@@ -1,0 +1,79 @@
+# Streaming RPCs. All streaming is WebSocket-only (design goal #2), so these run
+# on the websocket transport across both codecs.
+suite: streaming
+
+cases:
+  # Server streaming: three ordered messages then OK.
+  - name: server-stream/three
+    rpc: ServerStream
+    transports: [websocket]
+    codecs: [proto, json]
+    request:
+      response_definition:
+        stream_messages:
+          - { payload: { text: "a" } }
+          - { payload: { text: "b" } }
+          - { payload: { text: "c" } }
+    expect:
+      status: { code: 0 }
+      messages:
+        - { payload: { text: "a" } }
+        - { payload: { text: "b" } }
+        - { payload: { text: "c" } }
+
+  # Server streaming that emits some messages then fails: messages delivered in
+  # order, THEN the non-OK Trailer.
+  - name: server-stream/messages-then-error
+    rpc: ServerStream
+    transports: [websocket]
+    codecs: [proto, json]
+    request:
+      response_definition:
+        status_code: 8            # RESOURCE_EXHAUSTED
+        status_message: "quota"
+        stream_messages:
+          - { payload: { text: "a" } }
+          - { payload: { text: "b" } }
+    expect:
+      status: { code: 8, message_contains: "quota" }
+      messages:
+        - { payload: { text: "a" } }
+        - { payload: { text: "b" } }
+
+  # Client streaming: server counts what it received, returns aggregate + OK.
+  - name: client-stream/aggregate
+    rpc: ClientStream
+    transports: [websocket]
+    codecs: [proto, json]
+    requests:
+      - { payload: { text: "one" }, response_definition: { payload: { text: "ok" } } }
+      - { payload: { text: "two" } }
+      - { payload: { text: "three" } }
+    expect:
+      status: { code: 0 }
+      response:
+        payload: { text: "ok" }
+
+  # Bidi: server echoes each inbound message; interleaving allowed.
+  - name: bidi/echo
+    rpc: BidiStream
+    transports: [websocket]
+    codecs: [proto, json]
+    requests:
+      - { payload: { text: "a" }, response_definition: {} }
+      - { payload: { text: "b" } }
+    expect:
+      status: { code: 0 }
+      message_count: 2
+
+  # Client cancels mid-stream: the server must observe a Reset (CANCELLED) and stop.
+  # `cancel_after_messages` tells the driver to Reset the stream after N received.
+  - name: bidi/client-cancel
+    rpc: BidiStream
+    transports: [websocket]
+    codecs: [proto]
+    cancel_after_messages: 1
+    requests:
+      - { payload: { text: "a" }, response_definition: { stream_messages: [ { payload: { text: "a" } }, { payload: { text: "b" } } ] } }
+    expect:
+      status: { code: 1 }         # CANCELLED

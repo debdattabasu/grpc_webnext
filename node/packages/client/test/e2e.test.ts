@@ -8,7 +8,9 @@ import { makeClient, Metadata, type ServiceClient } from "../src/index.js";
 import { EchoDefinition } from "./gen/echo.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "../../..");
+// node/packages/client/test -> repo root is four levels up; the Cargo workspace lives in rust/.
+const repoRoot = path.resolve(__dirname, "../../../..");
+const rustRoot = path.join(repoRoot, "rust");
 
 let proc: ChildProcess;
 let client: ServiceClient<typeof EchoDefinition>;
@@ -16,7 +18,7 @@ let baseUrl: string;
 
 beforeAll(async () => {
   proc = spawn("cargo", ["run", "--quiet", "-p", "devserver"], {
-    cwd: repoRoot,
+    cwd: rustRoot,
     stdio: ["ignore", "pipe", "inherit"],
   });
   baseUrl = await new Promise<string>((resolve, reject) => {

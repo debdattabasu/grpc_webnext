@@ -9,7 +9,9 @@ import WebSocket from "ws";
 import { makePromiseClient, type PromiseServiceClient } from "../src/index.js";
 import { GreeterDefinition } from "../examples/gen/greeter.js";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+// node/packages/client/test -> repo root is four levels up; the Cargo workspace lives in rust/.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
+const rustRoot = path.join(repoRoot, "rust");
 
 let proc: ChildProcess;
 let client: PromiseServiceClient<typeof GreeterDefinition>;
@@ -20,7 +22,7 @@ async function* fromArray<T>(items: T[]): AsyncIterable<T> {
 
 beforeAll(async () => {
   proc = spawn("cargo", ["run", "--quiet", "-p", "example-greeter-server"], {
-    cwd: repoRoot,
+    cwd: rustRoot,
     stdio: ["ignore", "pipe", "inherit"],
   });
   const baseUrl = await new Promise<string>((resolve, reject) => {

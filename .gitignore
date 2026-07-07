@@ -1,6 +1,9 @@
-# Rust
-/target
+# Rust (Cargo builds into rust/target; match target/ anywhere, not just repo root)
+target/
 **/*.rs.bk
+
+# Go
+go/**/*.test
 
 # Node / TypeScript
 node_modules/

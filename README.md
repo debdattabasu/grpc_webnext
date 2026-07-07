@@ -1,51 +1,51 @@
 # grpc-webnext
 
 Full gRPC semantics in the browser — unary over **Fetch**, streaming over
-**WebSocket** — with a Rust server/proxy and a TypeScript client that mimics the
-Node gRPC API. Native gRPC and grpc-webnext coexist on **one port**.
+**WebSocket** — on the **same port** as native gRPC. A polyglot implementation of
+one wire protocol: native in-process servers per language, a schema-agnostic proxy
+for everything else, and clients that mimic the Node gRPC API.
 
 ```
-        Browser / Node (TypeScript client)
+        Browser / Node / Rust-WASM clients   (TypeScript ✅ · Rust ⬜)
               │  unary → Fetch          │  streaming → WebSocket
               ▼                          ▼
-        ┌─────────────────────────────────────────┐
-        │  grpc-webnext endpoint (one port)        │
-        │   • native server library  — wrap tonic  │
-        │   • standalone proxy       — front any    │
-        │                              gRPC server  │
-        └─────────────────────────────────────────┘
+        ┌──────────────────────────────────────────────────┐
+        │  grpc-webnext endpoint (one port)                │
+        │   in-process server:  Rust ✅ · Go ⬜ · Node ⬜     │
+        │   or standalone proxy (Rust) — front any gRPC    │
+        └──────────────────────────────────────────────────┘
               │ native application/grpc (same port, passthrough)
               ▼
         Any gRPC server (tonic, grpc-go, …)
 ```
 
+The wire format is defined once, in [`proto/grpc_webnext.proto`](proto/grpc_webnext.proto)
+and [`spec/PROTOCOL.md`](spec/PROTOCOL.md), and every implementation is held to it by a
+language-neutral [conformance suite](conformance/). The **proxy** is the universal
+fallback — front any gRPC server in any language; the per-language **in-process servers**
+are the native, no-extra-hop path for that runtime.
+
 ## Status
 
-All three deliverables work end-to-end, covered by integration tests
-(`cargo test`, `npm test`) and a runnable [demo](examples/README.md).
-
-| Deliverable | Crate / package | State |
+| Component | Location | State |
 |---|---|---|
-| Rust proxy — front any gRPC server | [`grpc-webnext-proxy`](crates/proxy) | ✅ unary + streaming, native gRPC same-port, deadlines, cancel |
-| Native Rust server — wrap a tonic `Router` | [`grpc-webnext-server`](crates/server) | ✅ + native gRPC same-port |
-| TypeScript client — browser + Node | [`@grpc-webnext/client`](clients/typescript) | ✅ Fetch + WebSocket, typed codegen |
-| Shared wire codec & translation | [`grpc-webnext-core`](crates/core) | ✅ |
-
-Binary protobuf and JSON are both wired. Deadlines (local + forwarded) and
-cancellation propagation are done on the proxy; JSON transcoding is served by the
-native library. Retry is intentionally **not** in the proxy — it's a client concern
-(a wire proxy that retries causes retry storms). Remaining polish (backpressure,
-streaming uploads, JSON-in-the-proxy) is tracked in [doc/BACKLOG.md](doc/BACKLOG.md).
+| Wire protocol + normative spec | [`proto/`](proto/), [`spec/PROTOCOL.md`](spec/PROTOCOL.md) | ✅ the contract |
+| Rust server + proxy | [`rust/crates/grpc-webnext`](rust/crates/grpc-webnext) | ✅ unary + streaming, `+json`, deadlines, cancel, native gRPC same-port |
+| TypeScript client (browser + Node) | [`node/packages/client`](node/packages/client) | ✅ Fetch + WebSocket, typed codegen, callback + promise APIs |
+| Go in-process server | [`go/webnext`](go/webnext) | ⬜ skeleton (API + router; protocol logic stubbed) |
+| Node in-process server | [`node/packages/server`](node/packages/server) | ⬜ skeleton |
+| Rust client (WASM / frontend) | `rust/crates/grpc-webnext-client` | ⬜ planned |
+| Conformance suite | [`conformance/`](conformance/) | ⬜ proto + cases + contract; harness next |
 
 ## Quickstart
 
 Run the full demo (starts the native Rust server, drives it from the TS client):
 
 ```bash
-cd clients/typescript && npm install && npm run demo
+cd node/packages/client && npm install && npm run demo
 ```
 
-Use the client in your own code. Two flavors share one transport:
+Use the TypeScript client in your own code. Two flavors share one transport:
 
 ```ts
 import { makeClient, makePromiseClient, Metadata } from "@grpc-webnext/client";
@@ -66,17 +66,20 @@ const sum = await rpc.concat(source);                         // client-stream -
 for await (const m of rpc.chat(source, { signal })) log(m);   // bidi, cancel via AbortSignal
 ```
 
-Front an existing gRPC server with the proxy:
+Front an existing gRPC server with the proxy (language-agnostic fallback):
 
 ```bash
+cd rust
 UPSTREAM=http://localhost:50051 LISTEN=127.0.0.1:8080 cargo run -p grpc-webnext-proxy
 ```
 
 Wrap a tonic server in-process (serves grpc-webnext + native gRPC on one port):
 
 ```rust
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig};
+
 let routes = tonic::service::Routes::new(GreeterServer::new(svc));
-grpc_webnext_server::serve(listener, routes, Default::default()).await?;
+let (addr, handle) = bind_and_serve_in_process(routes, ServerConfig::default()).await?;
 ```
 
 ## How it works
@@ -90,51 +93,67 @@ grpc_webnext_server::serve(listener, routes, Default::default()).await?;
   `application/grpc-webnext+proto`; WebSocket arrives as an HTTP/1.1 upgrade. Both
   the proxy and the native server forward native `application/grpc` untouched, so
   browsers and existing gRPC clients share one endpoint.
-- **Deadlines & cancellation.** The client sends `grpc-timeout`; the proxy enforces
-  it locally (dropping the call, which cancels the upstream) and forwards it
-  downstream. A client `Reset`/disconnect propagates to the upstream as a stream
-  reset.
-- **Schema-agnostic proxy.** A passthrough `BytesCodec` forwards message bytes
-  without needing the `.proto`.
+- **Deadlines & cancellation.** The client sends `grpc-timeout`; the server enforces
+  it locally and forwards it downstream. A client `Reset`/disconnect propagates to
+  the upstream as a stream reset.
+- **Schema-agnostic proxy.** A passthrough codec forwards message bytes without
+  needing the `.proto`; `+json` transcoding uses reflection or a bundled descriptor set.
 
-See [doc/PROTOCOL.md](doc/PROTOCOL.md) for the wire format and
-[doc/COMPATIBILITY.md](doc/COMPATIBILITY.md) for per-transport gRPC-semantics fidelity.
+See [spec/PROTOCOL.md](spec/PROTOCOL.md) for the wire format and
+[spec/COMPATIBILITY.md](spec/COMPATIBILITY.md) for per-transport gRPC-semantics fidelity.
 
 ## Repository layout
 
+Organized by language ecosystem — each toolchain owns its subtree — with the
+cross-language contract at the root.
+
 ```
-proto/                     grpc-webnext wire envelope (Frame, Metadatum, …)
-crates/
-  core/                    wire codec, gRPC framing, passthrough codec, metadata
-  proxy/                   standalone proxy (front any gRPC server)
-  server/                  native server library (wrap a tonic Router)
-  testecho/  devserver/    test-only Echo service + dev harness
-clients/typescript/        @grpc-webnext/client (Fetch + WebSocket transports)
-examples/                  Greeter service + end-to-end demo
+proto/                 grpc-webnext wire envelope (Frame, Metadatum, …) — source of truth
+spec/                  PROTOCOL.md (normative) + COMPATIBILITY.md
+conformance/           language-neutral conformance suite (proto, cases, contract)
+doc/                   design notes (STATUS, BACKLOG, UNIFICATION)
+
+rust/                  Cargo workspace
+  crates/grpc-webnext/   server library + proxy binary (grpc-webnext-proxy)
+  crates/testecho/       test-only Echo service
+  crates/devserver/      dev harness (testecho behind the proxy)
+  examples/              Greeter service + end-to-end demo
+
+node/                  npm workspace
+  packages/client/       @grpc-webnext/client (Fetch + WebSocket transports)
+  packages/server/       @grpc-webnext/server (in-process, skeleton)
+
+go/                    Go module (github.com/grpc-webnext/grpc-webnext/go)
+  webnext/               in-process server (skeleton)
 ```
 
 ## Design goals
 
-The original goals this project targets:
-
 1. Unary RPC over Fetch.
 2. All streaming RPCs over WebSocket.
-3. Serve binary (`application/grpc-webnext+proto`) or JSON
-   (`application/grpc-webnext+json`).
+3. Serve binary (`application/grpc-webnext+proto`) or JSON (`application/grpc-webnext+json`).
 4. WebSocket sends headers and trailers as protobuf messages.
-5. Fetch sends headers and trailers as HTTP headers / a buffered trailer block,
-   with a configurable size limit.
+5. Fetch sends headers and trailers as HTTP headers / a buffered trailer block, with a configurable size limit.
 6. Existing protoc works for both TypeScript and the backend.
 7. Frontend API mimics Node gRPC (need not be 1:1).
 8. Connection management, retry, deadline semantics match standard gRPC.
 9. Serve on the same port as native gRPC; content-type disambiguates.
 10. Optional client-side multiplexing of streams over a WebSocket pool.
-11. WebSocket multiplexing is strictly one message per WebSocket message (no
-    HTTP/2-style fragmentation).
+11. WebSocket multiplexing is strictly one message per WebSocket message (no HTTP/2-style fragmentation).
 
 ## Development
 
 ```bash
-cargo test                       # Rust: core, proxy, server
-cd clients/typescript && npm test # TypeScript: codec + e2e
+cd rust && cargo test                 # Rust: server + proxy (one crate), 90 tests
+cd node/packages/client && npm test   # TypeScript: codec + e2e (spawns the Rust example servers)
+cd go && go build ./... && go vet ./...  # Go: skeleton builds clean
 ```
+
+## Releasing
+
+One repo, independent publish targets on their own cadences:
+
+- **Rust** → crates.io (`cargo publish` from `rust/crates/grpc-webnext`).
+- **TypeScript** → npm (`@grpc-webnext/client`, `@grpc-webnext/server`).
+- **Go** → module `github.com/grpc-webnext/grpc-webnext/go`, tagged **`go/vX.Y.Z`**
+  (subdirectory modules require the path-prefixed tag).

@@ -12,15 +12,16 @@ A [`Greeter`](greeter.proto) service exercising every RPC cardinality:
 
 - [`greeter-server/`](greeter-server/) — a Rust binary that serves `Greeter` over
   grpc-webnext **and** native gRPC on one port, using the native server library
-  (`grpc-webnext-server`).
+  (the `grpc-webnext` crate).
 - The TypeScript client demo lives at
-  [`clients/typescript/examples/greeter.ts`](../clients/typescript/examples/greeter.ts).
-  It spawns the server, then drives all three RPCs with the generated client.
+  [`node/packages/client/examples/greeter.ts`](../../node/packages/client/examples/greeter.ts).
+  It spawns the server (via `cargo run` in `../rust`), then drives all three RPCs
+  with the generated client.
 
 ### Run it
 
 ```bash
-cd clients/typescript
+cd node/packages/client
 npm install
 npm run demo
 ```

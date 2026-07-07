@@ -1,0 +1,21 @@
+{
+  "name": "@grpc-webnext/server",
+  "version": "0.0.0",
+  "description": "grpc-webnext in-process server for Node: serve Fetch + WebSocket in front of a native gRPC server on one port.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}

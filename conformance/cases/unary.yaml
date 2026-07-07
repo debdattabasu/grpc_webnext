@@ -1,0 +1,65 @@
+# Unary RPCs. Run over BOTH transports (Fetch and a single WebSocket stream) and
+# BOTH codecs, since a server must serve unary identically on either surface.
+suite: unary
+
+cases:
+  - name: ok
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto, json]
+    request:
+      payload: { text: "hello" }
+      response_definition:
+        payload: { text: "hello" }
+    expect:
+      status: { code: 0 }
+      response:
+        payload: { text: "hello" }
+
+  - name: empty-payload
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto, json]
+    request:
+      payload: { text: "" }
+      response_definition:
+        payload: { text: "" }
+    expect:
+      status: { code: 0 }
+      response:
+        payload: { text: "" }
+
+  # A non-OK status with a message and trailing metadata. On Fetch this is the
+  # buffered trailer block; on WebSocket it is a Trailer frame — both must decode
+  # to the same {code, message, trailers}.
+  - name: error-with-trailers
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto, json]
+    request:
+      payload: { text: "x" }
+      response_definition:
+        status_code: 9            # FAILED_PRECONDITION
+        status_message: "nope"
+        trailers:
+          - { key: "x-detail", ascii: "denied" }
+    expect:
+      status: { code: 9, message_contains: "nope" }
+      trailers_contain:
+        - { key: "x-detail", ascii: "denied" }
+
+  # Initial metadata must survive as Fetch response headers / a WS Header frame.
+  - name: response-headers
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto, json]
+    request:
+      payload: { text: "x" }
+      response_definition:
+        payload: { text: "x" }
+        headers:
+          - { key: "x-greeting", ascii: "hi" }
+    expect:
+      status: { code: 0 }
+      headers_contain:
+        - { key: "x-greeting", ascii: "hi" }

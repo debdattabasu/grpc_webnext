@@ -1,0 +1,63 @@
+# Deadline propagation. The client sets grpc-timeout; the server sleeps past it.
+# Every surface must terminate the call with DEADLINE_EXCEEDED (code 4) rather
+# than hanging or returning the delayed payload.
+suite: deadline
+
+cases:
+  - name: unary/exceeded/fetch
+    rpc: Unary
+    transports: [fetch]
+    codecs: [proto, json]
+    timeout_millis: 100
+    request:
+      payload: { text: "x" }
+      response_definition:
+        payload: { text: "x" }
+        delay_ms: 2000
+    expect:
+      status: { code: 4 }
+
+  - name: unary/exceeded/websocket
+    rpc: Unary
+    transports: [websocket]
+    codecs: [proto, json]
+    timeout_millis: 100
+    request:
+      payload: { text: "x" }
+      response_definition:
+        payload: { text: "x" }
+        delay_ms: 2000
+    expect:
+      status: { code: 4 }
+
+  # Deadline within a server stream: some messages arrive, then DEADLINE_EXCEEDED
+  # once the per-message delay pushes past the timeout.
+  - name: server-stream/exceeded
+    rpc: ServerStream
+    transports: [websocket]
+    codecs: [proto]
+    timeout_millis: 250
+    request:
+      response_definition:
+        stream_messages:
+          - { payload: { text: "a" }, delay_ms: 0 }
+          - { payload: { text: "b" }, delay_ms: 2000 }
+    expect:
+      status: { code: 4 }
+
+  # A generous deadline that is NOT exceeded still completes OK — guards against a
+  # server that treats any timeout as expiry.
+  - name: unary/within-deadline
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto]
+    timeout_millis: 5000
+    request:
+      payload: { text: "x" }
+      response_definition:
+        payload: { text: "x" }
+        delay_ms: 50
+    expect:
+      status: { code: 0 }
+      response:
+        payload: { text: "x" }

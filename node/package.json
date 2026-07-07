@@ -1,0 +1,14 @@
+{
+  "name": "@grpc-webnext/monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "grpc-webnext JavaScript/TypeScript workspace: client (browser + node) and in-process server.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  }
+}

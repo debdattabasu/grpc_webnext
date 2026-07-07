@@ -1,0 +1,72 @@
+# Size limits and metadata fidelity — exactly the class of behavior that drifted
+# between the Rust proxy and native server (see doc/STATUS.md). Pinning it here so
+# no future implementation can diverge silently.
+suite: limits
+
+# NOTE: cases with `requires:` depend on the server being started with a specific
+# config (documented in conformance/README.md "Server config profiles"). The
+# harness selects the matching server profile; a server that cannot honor a
+# profile marks the case SKIPPED (surfaced in the report — never silently passed).
+cases:
+  # Server produces a response larger than the configured max message size.
+  # Must terminate with RESOURCE_EXHAUSTED (code 8), not truncate or hang.
+  - name: oversize-response-rejected
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto]
+    requires: { max_message_bytes: 1048576 }   # 1 MiB
+    request:
+      payload: { text: "x" }
+      response_definition:
+        oversize_response_bytes: 2097152          # 2 MiB > limit
+    expect:
+      status: { code: 8 }
+
+  # A response just under the limit passes intact.
+  - name: large-response-within-limit
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto]
+    requires: { max_message_bytes: 4194304 }   # 4 MiB
+    request:
+      payload: { text: "x" }
+      response_definition:
+        oversize_response_bytes: 1048576          # 1 MiB < limit
+    expect:
+      status: { code: 0 }
+
+  # +json requested against a server with no transcoder configured must be
+  # UNIMPLEMENTED (code 12) — the documented capability-gap behavior — on BOTH
+  # surfaces (Fetch 415-equivalent status / WS Reset).
+  - name: json-without-transcoder
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [json]
+    requires: { transcoder: false }
+    request:
+      payload: { text: "x" }
+      response_definition:
+        payload: { text: "x" }
+    expect:
+      status: { code: 12 }
+
+  # ASCII + binary (-bin) request metadata must round-trip to the server unchanged.
+  # The driver attaches `request_metadata`; the server echoes it in request_info.
+  - name: metadata-roundtrip
+    rpc: Unary
+    transports: [fetch, websocket]
+    codecs: [proto, json]
+    request_metadata:
+      - { key: "x-ascii", ascii: "plain" }
+      - { key: "x-blob-bin", b64: "AQIDBA==" }
+    request:
+      payload: { text: "x" }
+      response_definition:
+        payload: { text: "x" }
+    expect:
+      status: { code: 0 }
+      response:
+        request_info:
+          request_headers_contain:
+            - { key: "x-ascii", ascii: "plain" }
+            - { key: "x-blob-bin", b64: "AQIDBA==" }

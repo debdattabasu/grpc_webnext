@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+// ============================================================================
+// grpc-webnext conformance service.
+//
+// Every server implementation (Rust, Go, Node, …) serves THIS service over
+// grpc-webnext. A language-neutral client driver runs the scenarios in
+// `conformance/cases/*.yaml` against it and asserts the observed wire behavior.
+// That matrix — {client drivers} × {server impls} × {transports} × {codecs} —
+// is how five independent implementations of one wire protocol are kept from
+// drifting. See `conformance/README.md`.
+//
+// The design mirrors connectrpc/conformance: the *request* carries a
+// ResponseDefinition telling the server exactly how to respond (payload,
+// status, metadata, timing), so a single generic service exercises every
+// protocol feature without per-case server code.
+// ============================================================================
+
+package grpc.webnext.conformance.v1;
+
+service ConformanceService {
+  // Unary over Fetch (or a single WebSocket stream). Echoes `payload` unless the
+  // ResponseDefinition says otherwise; used for status, metadata, deadline, and
+  // size-limit cases.
+  rpc Unary(UnaryRequest) returns (ConformancePayload);
+
+  // Server streaming: emits ResponseDefinition.stream_messages in order, honoring
+  // per-message `delay_ms`, then closes with ResponseDefinition.status.
+  rpc ServerStream(ServerStreamRequest) returns (stream ConformancePayload);
+
+  // Client streaming: consumes the inbound stream, then returns one response built
+  // from the ResponseDefinition on the FIRST request (later requests carry payload
+  // only). `aggregate` reports what the server received.
+  rpc ClientStream(stream ClientStreamRequest) returns (ClientStreamResponse);
+
+  // Bidi: for each inbound message, echoes one ConformancePayload back; closes with
+  // the ResponseDefinition.status from the first request. Exercises interleaving,
+  // half-close, and mid-stream Reset/cancel.
+  rpc BidiStream(stream BidiStreamRequest) returns (stream ConformancePayload);
+}
+
+// How the server should respond. Present on unary requests and the first request of
+// a streaming RPC; ignored on subsequent streaming requests.
+message ResponseDefinition {
+  // Terminal gRPC status. code 0 = OK. For streaming, applied after all messages.
+  uint32 status_code = 1;
+  string status_message = 2;
+
+  // Metadata the server must emit. `headers` go out as initial metadata (WS Header
+  // frame / Fetch response headers); `trailers` in the terminal Trailer/trailer block.
+  repeated Metadatum headers = 3;
+  repeated Metadatum trailers = 4;
+
+  // Unary/bidi: the payload to echo back. Streaming: see `stream_messages`.
+  bytes payload = 5;
+
+  // Server-streaming: the ordered messages to emit before the terminal status.
+  repeated StreamMessage stream_messages = 6;
+
+  // Sleep this long before producing the (first) response. Drives deadline tests:
+  // set delay > the case's grpc-timeout and expect DEADLINE_EXCEEDED (code 4).
+  uint32 delay_ms = 7;
+
+  // If > 0, the unary/echo payload the server returns is this many bytes (server
+  // fabricates it). Drives max-message-size cases (expect RESOURCE_EXHAUSTED = 8
+  // when it exceeds the configured limit).
+  uint32 oversize_response_bytes = 8;
+}
+
+message StreamMessage {
+  bytes payload = 1;
+  uint32 delay_ms = 2;  // sleep before emitting this message
+}
+
+message UnaryRequest {
+  bytes payload = 1;
+  ResponseDefinition response_definition = 2;
+}
+
+message ServerStreamRequest {
+  ResponseDefinition response_definition = 1;
+}
+
+message ClientStreamRequest {
+  bytes payload = 1;
+  ResponseDefinition response_definition = 2;  // honored on first request only
+}
+
+message ClientStreamResponse {
+  ConformancePayload payload = 1;
+  uint32 received_count = 2;   // how many client messages the server saw
+  uint64 received_bytes = 3;   // total payload bytes received
+}
+
+message BidiStreamRequest {
+  bytes payload = 1;
+  ResponseDefinition response_definition = 2;  // honored on first request only
+}
+
+// What the server sends back. `request_info` lets a case assert what the server
+// actually received (echoed metadata, timeout, codec), catching silent drops.
+message ConformancePayload {
+  bytes payload = 1;
+  RequestInfo request_info = 2;
+}
+
+message ClientStreamResponseInfo {
+  uint32 received_count = 1;
+}
+
+// Observed request context, echoed for assertions.
+message RequestInfo {
+  repeated Metadatum request_headers = 1;
+  uint32 timeout_millis = 2;   // the grpc-timeout the server observed; 0 = none
+  bool json = 3;               // did the request arrive on the +json codec
+}
+
+// One metadata entry. Binary values (keys ending in "-bin") use `bin_value`.
+message Metadatum {
+  string key = 1;
+  oneof value {
+    string ascii_value = 2;
+    bytes  bin_value   = 3;
+  }
+}

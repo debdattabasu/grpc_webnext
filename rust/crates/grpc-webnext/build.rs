@@ -17,14 +17,16 @@ fn main() {
         .compile_protos(&protos, &["proto"])
         .expect("failed to compile reflection protos");
 
-    // The grpc-webnext wire types (frames, metadata, status).
-    let webnext = "../../proto/grpc_webnext.proto";
+    // The grpc-webnext wire types (frames, metadata, status). The proto lives at the
+    // repo root (`/proto`), shared across the Rust/Go/Node implementations; from this
+    // crate (`rust/crates/grpc-webnext`) that is three levels up.
+    let webnext = "../../../proto/grpc_webnext.proto";
     println!("cargo:rerun-if-changed={webnext}");
     prost_build::Config::new()
         .out_dir(&out)
         // Decode `bytes` fields (message payloads, initial_payload, bin metadata) as `Bytes`
         // rather than `Vec<u8>`, so the WS path slices payloads instead of copying them.
         .bytes(["."])
-        .compile_protos(&[webnext], &["../../proto"])
+        .compile_protos(&[webnext], &["../../../proto"])
         .expect("failed to compile grpc_webnext.proto");
 }

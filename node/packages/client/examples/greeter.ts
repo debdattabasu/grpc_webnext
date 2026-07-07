@@ -3,7 +3,7 @@
  *
  * Spawns the example Greeter server (native grpc-webnext server, serving Fetch +
  * WebSocket + native gRPC on one port), then drives every RPC cardinality with
- * the TypeScript client. Run with: `npm run demo` from clients/typescript.
+ * the TypeScript client. Run with: `npm run demo` from node/packages/client.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -13,11 +13,13 @@ import WebSocket from "ws";
 import { makeClient, Metadata } from "../src/index.js";
 import { GreeterDefinition } from "./gen/greeter.js";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+// node/packages/client/examples -> repo root is four levels up; the Cargo workspace lives in rust/.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
+const rustRoot = path.join(repoRoot, "rust");
 
 async function startServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
   const proc = spawn("cargo", ["run", "--quiet", "-p", "example-greeter-server"], {
-    cwd: repoRoot,
+    cwd: rustRoot,
     stdio: ["ignore", "pipe", "inherit"],
   });
   const baseUrl = await new Promise<string>((resolve, reject) => {

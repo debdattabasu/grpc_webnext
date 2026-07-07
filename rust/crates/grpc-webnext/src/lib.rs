@@ -82,7 +82,7 @@ pub type ResBody = UnsyncBoxBody<Bytes, BoxError>;
 // --- Auth hooks (in-process surface) ----------------------------------------
 
 /// Authorize a WebSocket connection at handshake time (see the connection-gate docs in
-/// `doc/PROTOCOL.md`). Given the gRPC method the credential is scoped to and the request
+/// `spec/PROTOCOL.md`). Given the gRPC method the credential is scoped to and the request
 /// headers; `Err(status)` closes the accepted socket with a `4000 + code` close frame.
 pub type ConnectAuthFn = Arc<dyn Fn(&str, &HeaderMap) -> Result<(), Status> + Send + Sync>;
 
