@@ -1,5 +1,11 @@
-export { Client } from "./client.js";
-export type { CallOptions, ClientOptions, Codec } from "./client.js";
+export { Client, resolveTransportSelection } from "./client.js";
+export type {
+  CallOptions,
+  ClientOptions,
+  Codec,
+  StreamTransport,
+  UnaryTransport,
+} from "./client.js";
 export { makeClient } from "./service.js";
 export type {
   MethodInfo,

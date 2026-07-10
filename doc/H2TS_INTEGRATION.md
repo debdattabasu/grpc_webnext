@@ -123,12 +123,14 @@ JSON differ only in payload encoding (protobuf frames vs plaintext JSON frames).
 
 ## Phasing
 
-- **Phase 0 — unblock.** `h2ts` client publishes to npm. Decide dependency sourcing (below).
-- **Phase 1 — binary default, end-to-end.** Client H2 transport + gRPC shim; in-process
-  `serve_h2(routes)`; proxy `bridge`. Prove with a greeter round-trip across all four
-  cardinalities. Touch nothing else — no config knobs, no custom-path changes, don't delete
-  the multiplexer yet.
-- **Phase 2 — config knobs.** `unary: fetch`; `streaming: ws`.
+- **Phase 0 — unblock.** ✅ `h2ts` published to npm (`@debdattabasu/h2ts@0.1.1`) + crates.io
+  (`h2ts-server@0.1.1`); pulled in directly.
+- **Phase 1 — binary default, end-to-end.** ✅ Client H2 transport + gRPC shim; in-process
+  `serve_h2(routes)`; proxy `bridge`. Proven with a greeter round-trip across all four
+  cardinalities (+ deadline, cancel) on both surfaces. Landed as an opt-in.
+- **Phase 2 — config knobs.** ✅ Per-client `{ codec, unary, streaming }`: proto defaults to
+  `h2ts`/`h2ts`, `json` locked to `fetch`/`ws`, unsupported combos rejected. h2ts is now the
+  proto default; `unary: "fetch"` / `streaming: "ws"` are the opt-outs.
 - **Phase 3 — retire multiplexing.** Delete `stream_id` + pool; collapse the `Frame` WS
   handler (both codecs) to single-stream.
 - **Phase 4 — spec + conformance rework**, then the Go/Node h2ts gateways.

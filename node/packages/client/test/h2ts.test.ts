@@ -41,15 +41,14 @@ function spawnServer(pkg: string): Promise<{ proc: ChildProcess; baseUrl: string
 describe("in-process greeter over h2ts (real gRPC via serve_h2)", () => {
   let proc: ChildProcess;
   let client: PromiseServiceClient<typeof GreeterDefinition>;
+  let baseUrl: string;
 
   beforeAll(async () => {
     const server = await spawnServer("example-greeter-server");
     proc = server.proc;
-    client = makePromiseClient(GreeterDefinition, {
-      baseUrl: server.baseUrl,
-      webSocketImpl: wsImpl,
-      h2ts: true,
-    });
+    baseUrl = server.baseUrl;
+    // No transport options: proto now defaults to { unary: h2ts, streaming: h2ts }.
+    client = makePromiseClient(GreeterDefinition, { baseUrl, webSocketImpl: wsImpl });
   }, 60_000);
 
   afterAll(() => {
@@ -103,6 +102,23 @@ describe("in-process greeter over h2ts (real gRPC via serve_h2)", () => {
       })(),
     ).rejects.toMatchObject({ code: Status.CANCELLED });
   });
+
+  it("mixed config: unary over Fetch, streaming over h2ts", async () => {
+    const mixed = makePromiseClient(GreeterDefinition, {
+      baseUrl,
+      webSocketImpl: wsImpl,
+      unary: "fetch",
+      streaming: "h2ts",
+    });
+    try {
+      expect((await mixed.sayHello({ name: "mixed" })).message).toBe("Hello, mixed!");
+      const ticks: number[] = [];
+      for await (const t of mixed.countdown({ from: 2 })) ticks.push(t.value);
+      expect(ticks).toEqual([2, 1, 0]);
+    } finally {
+      mixed.close();
+    }
+  });
 });
 
 describe("proxy -> echo over h2ts (real gRPC via bridge byte-pump)", () => {
@@ -112,10 +128,10 @@ describe("proxy -> echo over h2ts (real gRPC via bridge byte-pump)", () => {
   beforeAll(async () => {
     const server = await spawnServer("devserver");
     proc = server.proc;
+    // Default transport (h2ts) — proves the proxy's bridge path is the default too.
     client = makePromiseClient(EchoDefinition, {
       baseUrl: server.baseUrl,
       webSocketImpl: wsImpl,
-      h2ts: true,
     });
   }, 60_000);
 

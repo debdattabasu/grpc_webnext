@@ -25,6 +25,14 @@ export interface CallOptions {
 /** Wire codec for application messages. */
 export type Codec = "proto" | "json";
 
+/** Where unary calls go: real gRPC over h2ts (proto default), or the buffered-trailer Fetch path. */
+export type UnaryTransport = "h2ts" | "fetch";
+/**
+ * Where streaming calls go: real gRPC over h2ts, H2-multiplexed over one WebSocket
+ * (proto default), or the custom `Frame` protocol, one WebSocket per stream.
+ */
+export type StreamTransport = "h2ts" | "ws";
+
 export interface ClientOptions {
   /** Base URL, e.g. "http://localhost:8080" or "https://api.example.com". */
   baseUrl: string;
@@ -39,11 +47,51 @@ export interface ClientOptions {
   /** WebSocket pool size when `multiplex` is set. Default 1. */
   poolSize?: number;
   /**
-   * Run the binary path over **real gRPC via h2ts** (HTTP/2 tunneled over one
-   * WebSocket) for both unary and streaming — the `{ unary: h2ts, streaming: h2ts }`
-   * default. Requires the proto codec. Off by default while this lands.
+   * Where unary calls go. Proto default `"h2ts"` (real gRPC over one HTTP/2 tunnel);
+   * `"fetch"` uses the buffered-trailer Fetch path. Forced to `"fetch"` for `codec: "json"`.
    */
-  h2ts?: boolean;
+  unary?: UnaryTransport;
+  /**
+   * Where streaming calls go. Proto default `"h2ts"` (H2-multiplexed over one WebSocket);
+   * `"ws"` uses the custom Frame protocol, one WebSocket per stream. Forced to `"ws"`
+   * for `codec: "json"`.
+   */
+  streaming?: StreamTransport;
+}
+
+/**
+ * Resolve the per-client transport selection from the config, applying the JSON lock and
+ * rejecting unsupported combinations. Exposed for testing.
+ *
+ * - `codec: "json"` is locked to `{ unary: "fetch", streaming: "ws" }` (JSON stays
+ *   plaintext and never rides h2ts); combining it with an h2ts knob throws.
+ * - proto defaults to `{ unary: "h2ts", streaming: "h2ts" }`; an explicit `streaming: "ws"`
+ *   defaults unary to `"fetch"` (its only valid pairing).
+ * - `{ unary: "h2ts", streaming: "ws" }` (both explicit) throws: an h2ts unary already opens
+ *   the tunnel, so streaming should ride it too (or send unary over Fetch).
+ */
+export function resolveTransportSelection(options: {
+  codec?: Codec;
+  unary?: UnaryTransport;
+  streaming?: StreamTransport;
+}): { unary: UnaryTransport; streaming: StreamTransport } {
+  if ((options.codec ?? "proto") === "json") {
+    if (options.unary === "h2ts" || options.streaming === "h2ts") {
+      throw new Error(
+        "grpc-webnext: codec 'json' cannot use h2ts — JSON stays plaintext (unary over Fetch, one WebSocket per stream)",
+      );
+    }
+    return { unary: "fetch", streaming: "ws" };
+  }
+  const streaming = options.streaming ?? "h2ts";
+  // `ws` streaming pairs only with `fetch` unary, so default unary to match.
+  const unary = options.unary ?? (streaming === "ws" ? "fetch" : "h2ts");
+  if (unary === "h2ts" && streaming === "ws") {
+    throw new Error(
+      "grpc-webnext: { unary: 'h2ts', streaming: 'ws' } is unsupported — an h2ts unary opens the tunnel, so use streaming: 'h2ts', or unary: 'fetch' to keep streams on 'ws'",
+    );
+  }
+  return { unary, streaming };
 }
 
 type Serialize<T> = (value: T) => Uint8Array;
@@ -59,30 +107,33 @@ export class Client {
   private readonly streamTransport: Transport;
 
   constructor(options: ClientOptions) {
-    // Binary over real gRPC via h2ts: one multiplexed H2 connection serves both unary
-    // and streaming, so both transports are the same instance.
-    if (options.h2ts) {
-      const transport = new H2tsTransport({
-        baseUrl: options.baseUrl,
-        webSocketImpl: options.webSocketImpl,
-      });
-      this.unaryTransport = transport;
-      this.streamTransport = transport;
-      return;
-    }
-    this.unaryTransport = new FetchTransport({
-      baseUrl: options.baseUrl,
-      maxMessageBytes: options.maxMessageBytes,
-      fetch: options.fetch,
-      codec: options.codec,
-    });
-    this.streamTransport = new WebSocketTransport({
-      baseUrl: options.baseUrl,
-      webSocketImpl: options.webSocketImpl,
-      codec: options.codec,
-      multiplex: options.multiplex,
-      poolSize: options.poolSize,
-    });
+    const selection = resolveTransportSelection(options);
+    // When either surface uses h2ts, share ONE H2Connection across both (H2 multiplexes).
+    const h2ts =
+      selection.unary === "h2ts" || selection.streaming === "h2ts"
+        ? new H2tsTransport({ baseUrl: options.baseUrl, webSocketImpl: options.webSocketImpl })
+        : undefined;
+
+    this.unaryTransport =
+      selection.unary === "h2ts"
+        ? h2ts!
+        : new FetchTransport({
+            baseUrl: options.baseUrl,
+            maxMessageBytes: options.maxMessageBytes,
+            fetch: options.fetch,
+            codec: options.codec,
+          });
+
+    this.streamTransport =
+      selection.streaming === "h2ts"
+        ? h2ts!
+        : new WebSocketTransport({
+            baseUrl: options.baseUrl,
+            webSocketImpl: options.webSocketImpl,
+            codec: options.codec,
+            multiplex: options.multiplex,
+            poolSize: options.poolSize,
+          });
   }
 
   close(): void {

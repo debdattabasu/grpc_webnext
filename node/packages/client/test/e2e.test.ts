@@ -29,9 +29,13 @@ beforeAll(async () => {
     });
     proc.on("exit", (code) => reject(new Error(`devserver exited early: ${code}`)));
   });
+  // Pin the custom transports: this suite exercises the Fetch-unary + custom-WS paths
+  // (proto now defaults to h2ts).
   client = makeClient(EchoDefinition, {
     baseUrl,
     webSocketImpl: WebSocket as unknown as typeof globalThis.WebSocket,
+    unary: "fetch",
+    streaming: "ws",
   });
 }, 60_000);
 
@@ -90,6 +94,8 @@ describe("generated client -> proxy -> echo", () => {
     const mux = makeClient(EchoDefinition, {
       baseUrl,
       multiplex: true,
+      unary: "fetch",
+      streaming: "ws",
       webSocketImpl: WebSocket as unknown as typeof globalThis.WebSocket,
     });
     const run = (msgs: string[]) =>

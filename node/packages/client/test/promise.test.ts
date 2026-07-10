@@ -31,9 +31,13 @@ beforeAll(async () => {
     });
     proc.on("exit", (code) => reject(new Error(`server exited early: ${code}`)));
   });
+  // Pin the custom transports: this suite exercises the Fetch-unary + custom-WS paths
+  // (proto now defaults to h2ts).
   client = makePromiseClient(GreeterDefinition, {
     baseUrl,
     webSocketImpl: WebSocket as unknown as typeof globalThis.WebSocket,
+    unary: "fetch",
+    streaming: "ws",
   });
 }, 60_000);
 
