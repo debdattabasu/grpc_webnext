@@ -125,7 +125,11 @@ pub(crate) async fn serve(rt: Runtime, websocket: HyperWebsocket, reject: Option
                     _ => continue,
                 };
                 let Some((frame, json)) = decoded else { continue };
-                handle_frame(&rt, frame, json, &annotation, &outbound_tx, &mut stream).await;
+                if !handle_frame(&rt, frame, json, &annotation, &outbound_tx, &mut stream).await {
+                    // A failed per-stream auth check: the client has its status (Reset +
+                    // close frame are queued); tear the connection down.
+                    break;
+                }
             }
         }
     }
@@ -137,6 +141,10 @@ pub(crate) async fn serve(rt: Runtime, websocket: HyperWebsocket, reject: Option
     let _ = writer.await;
 }
 
+/// Process one inbound `Frame`. Returns `false` when the connection must be torn down —
+/// a failed per-stream auth check, matching the connection-gate's door-slam — in which case
+/// the caller breaks its read loop and closes the socket. Every other outcome (including a
+/// non-auth `Reset`) keeps the connection open and returns `true`.
 async fn handle_frame(
     rt: &Runtime,
     frame: Frame,
@@ -144,31 +152,33 @@ async fn handle_frame(
     annotation: &Option<Arc<WsBinding>>,
     outbound_tx: &mpsc::Sender<TungMessage>,
     stream: &mut Option<StreamState>,
-) {
+) -> bool {
     match frame.kind {
         Some(Kind::Subscribe(sub)) => {
             if stream.is_some() {
                 send_reset(outbound_tx, json, Code::InvalidArgument, "stream already open").await;
-                return;
+                return true;
             }
             // An opening frame may carry the first message inline; hold it to the size limit.
             if sub.initial_payload.len() > rt.cfg.max_message_bytes {
                 send_reset(outbound_tx, json, Code::ResourceExhausted, "request message exceeds size limit").await;
-                return;
+                return true;
             }
             let path: PathAndQuery = match sub.method.parse() {
                 Ok(p) => p,
                 Err(_) => {
                     send_reset(outbound_tx, json, Code::InvalidArgument, "invalid method").await;
-                    return;
+                    return true;
                 }
             };
-            // Per-stream authorization from the Subscribe metadata.
+            // Per-stream authorization from the Subscribe metadata. On failure, hand the
+            // client the gRPC status as a Reset, then close the connection (return false).
             let md = metadata::metadata_vec_to_metadata(&sub.headers);
             if let Some(auth) = &rt.cfg.stream_auth {
                 if let Err(status) = auth(&sub.method, &md) {
                     send_reset(outbound_tx, json, status.code(), status.message()).await;
-                    return;
+                    let _ = outbound_tx.send(close_for_status(&status)).await;
+                    return false;
                 }
             }
 
@@ -192,6 +202,7 @@ async fn handle_frame(
                 rt.clone(), path, headers, timeout, req_rx, outbound_tx.clone(), json, annotation.clone(),
             ));
             *stream = Some(StreamState { req_tx: req_tx_state, task });
+            true
         }
         Some(Kind::Message(msg)) => {
             if msg.payload.len() > rt.cfg.max_message_bytes {
@@ -199,25 +210,28 @@ async fn handle_frame(
                 if let Some(state) = stream.take() {
                     state.task.abort();
                 }
-                return;
+                return true;
             }
             if let Some(state) = stream {
                 if let Some(tx) = &state.req_tx {
                     let _ = tx.send(msg.payload).await;
                 }
             }
+            true
         }
         Some(Kind::HalfClose(_)) => {
             if let Some(state) = stream {
                 state.req_tx = None;
             }
+            true
         }
         Some(Kind::Reset(_)) => {
             if let Some(state) = stream.take() {
                 state.task.abort();
             }
+            true
         }
-        _ => {}
+        _ => true,
     }
 }
 

@@ -148,11 +148,50 @@ async fn single_stream_stream_auth_rejects_with_reset() {
     let url = start(config).await;
     // No bearer (so connect_auth doesn't apply); the open frame carries no auth metadata.
     let (mut ws, _) = connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
+    // The Subscribe alone triggers the auth check — no half-close needed (and the socket
+    // closes right after the reject, so a follow-up send would race the teardown).
     ws.send(subscribe(&[])).await.unwrap();
-    ws.send(half_close()).await.unwrap();
     let (code, msg) = read_until_status(&mut ws).await.expect("status");
     assert_eq!(code, Code::Unauthenticated as u32);
     assert_eq!(msg, "stream denied");
+}
+
+#[tokio::test]
+async fn stream_auth_reject_closes_the_socket() {
+    // A failed per-stream auth check hands the client the gRPC status as a Reset, then
+    // closes the connection with the same status in the close code (4000 + code) — so an
+    // unauthorized client can't keep the socket around. Mirrors the connect-gate door-slam.
+    let config = ServerConfig {
+        stream_auth: Some(Arc::new(|_m: &str, _md: &tonic::metadata::MetadataMap| {
+            Err(Status::permission_denied("nope"))
+        })),
+        allow_implicit_codec: true,
+        ..Default::default()
+    };
+    let url = start(config).await;
+    let (mut ws, _) = connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
+    ws.send(subscribe(&[])).await.unwrap();
+
+    // Drain to the close: a Reset carrying the status arrives first, then the Close frame.
+    let mut saw_reset = false;
+    let cf = loop {
+        match ws.next().await {
+            Some(Ok(TungMessage::Binary(data))) => {
+                if let Some(Kind::Reset(r)) = decode_frame(&data).unwrap().kind {
+                    assert_eq!(r.status_code, Code::PermissionDenied as u32);
+                    assert_eq!(r.status_message, "nope");
+                    saw_reset = true;
+                }
+            }
+            Some(Ok(TungMessage::Close(cf))) => break cf.expect("close carries a gRPC status"),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => panic!("socket errored before a clean close: {e}"),
+            None => panic!("socket ended without a Close frame"),
+        }
+    };
+    assert!(saw_reset, "the stream status arrives as a Reset before the close");
+    assert_eq!(u16::from(cf.code), 4000 + Code::PermissionDenied as u16);
+    assert_eq!(cf.reason.as_str(), "nope");
 }
 
 // ---- Fetch-path per-stream auth: the same `stream_auth` hook guards unary Fetch ----
