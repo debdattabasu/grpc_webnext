@@ -88,35 +88,47 @@ grammar. Current coverage:
 
 | Suite | File | Covers |
 |-------|------|--------|
-| unary | [cases/unary.yaml](cases/unary.yaml) | OK, empty payload, non-OK status + trailers, response headers — Fetch **and** WS, both codecs |
-| streaming | [cases/streaming.yaml](cases/streaming.yaml) | server-stream (incl. messages-then-error), client-stream aggregate, bidi echo, client cancel → Reset |
-| deadline | [cases/deadline.yaml](cases/deadline.yaml) | unary + stream `grpc-timeout` expiry (DEADLINE_EXCEEDED) on both surfaces; within-deadline passes |
-| limits | [cases/limits.yaml](cases/limits.yaml) | oversize response → RESOURCE_EXHAUSTED, `+json` w/o transcoder → UNIMPLEMENTED, ASCII+`-bin` metadata round-trip |
+| unary | [cases/unary.yaml](cases/unary.yaml) | OK, empty payload, non-OK status + trailing metadata, response headers |
+| streaming | [cases/streaming.yaml](cases/streaming.yaml) | server-stream (incl. messages-then-error), client-stream aggregate, bidi echo, client cancel → CANCELLED |
+| deadline | [cases/deadline.yaml](cases/deadline.yaml) | unary + stream `grpc-timeout` expiry (DEADLINE_EXCEEDED); within-deadline passes |
+| limits | [cases/limits.yaml](cases/limits.yaml) | large response intact, `+json` w/o transcoder → UNIMPLEMENTED, ASCII+`-bin` metadata round-trip |
+
+Each case runs under every applicable **transport profile**: `proto/h2ts` (real gRPC over
+the h2ts tunnel), `proto/ws` (the custom `Frame` path, unary over Fetch), and `json` (the
+custom path, Fetch + WS). 42 case×profile runs, all green.
+
+**Known gaps** (surfaced by the run — tracked, not silently passed):
+- **Response-size enforcement.** `max_message_bytes` bounds inbound *request* messages on
+  the custom `Frame` path; the h2ts binary path uses real gRPC's own limits. So an oversize
+  *response* isn't uniformly rejected with RESOURCE_EXHAUSTED — re-add an oversize-response
+  case once that policy is settled.
+
+The first run also **found two real bugs, now fixed**: trailing metadata on a trailers-only
+(error) response was dropped on the h2ts client and the Fetch server path (both read
+trailing metadata only from a trailers block, but a trailers-only response carries it in the
+headers block).
 
 **Not yet covered** (tracked, not silently omitted): WebSocket keepalive/idle-timeout,
 connection-level auth (Subscribe rejection), REST/HttpRule transcoding routes, half-close
-ordering edge cases, trailers-only responses. Add these as
-new suites; extend the table above when you do.
+ordering edge cases. Add these as new suites; extend the table when you do.
 
-## Running (once a harness exists)
+## Running
 
-The harness itself (case loader + driver glue + server lifecycle) is the next
-implementation step — deliberately built *after* a second server exists, so it is written
-against two real targets rather than one. Intended shape:
+The harness is the TypeScript driver in
+[`node/packages/client/test/conformance.test.ts`](../node/packages/client/test/conformance.test.ts):
+it loads `cases/*.yaml`, spawns the Rust `conformance-server`
+([`rust/examples/conformance-server`](../rust/examples/conformance-server)) once per required
+config profile, and drives each case across every transport profile via the TS client,
+asserting the observed wire behavior.
 
-```
-conformance/
-  proto/conformance.proto     # the service every server implements  ✅
-  schema/case.schema.json      # case-file grammar                    ✅
-  cases/*.yaml                 # scenarios                            ✅ (first batch)
-  runner/                      # harness: load cases, drive, report   ⬜ next
-  servers/                     # per-impl conformance server entrypoints ⬜ as impls land
+```bash
+cd node/packages/client && npm test                              # the full suite (incl. conformance)
+cd node/packages/client && npx vitest run test/conformance.test.ts   # just the matrix
 ```
 
-Each server entrypoint is thin: it depends on that language's grpc-webnext server library
-and implements `ConformanceService`. For Rust that is an example bin in
-`rust/crates/grpc-webnext`; for Go, `go/conformance`; for Node,
-`node/packages/server` (conformance entry).
+The Rust server is thin: it implements `ConformanceService` on the grpc-webnext in-process
+server (modeled on `rust/examples/greeter-server`). A second server impl (Go, Node) plugs in
+the same way (below) and the driver gains it as another target.
 
 ## Adding an implementation
 

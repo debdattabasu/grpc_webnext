@@ -218,9 +218,13 @@ function metadataFromRecord(record: Record<string, string>): Metadata {
 function statusFromResponse(res: H2Response): StatusResult {
   // Status lives in the trailers; a trailers-only (error) response puts it in the headers.
   const trailers = res.trailers();
-  const raw = readStatus(trailers) ?? readStatus(res.headers);
+  const fromTrailers = readStatus(trailers);
+  const raw = fromTrailers ?? readStatus(res.headers);
   if (raw) {
-    return { code: raw.code, details: raw.message, metadata: metadataFromRecord(trailers ?? {}) };
+    // A trailers-only response carries its trailing metadata in the headers block, not a
+    // separate trailers block — read the trailing metadata from wherever the status came.
+    const source = fromTrailers ? trailers : res.headers;
+    return { code: raw.code, details: raw.message, metadata: metadataFromRecord(source ?? {}) };
   }
   if (res.status === 200) return { code: Status.OK, details: "", metadata: new Metadata() };
   return { code: httpToStatus(res.status), details: `HTTP ${res.status}`, metadata: new Metadata() };

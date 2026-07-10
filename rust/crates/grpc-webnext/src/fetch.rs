@@ -243,13 +243,17 @@ async fn unary_proto(rt: &Runtime, req: Request<Incoming>) -> Response<ResBody> 
         Err(e) => return fetch_status(Code::Unavailable, &format!("upstream: {e}")),
     };
     let (resp_parts, mut resp_body) = resp.into_parts();
+    let resp_headers = resp_parts.headers;
+    // A trailers-only response (a gRPC error before any message) carries grpc-status in the
+    // HEADERS block, and its metadata is *trailing*, not initial — route it to the trailer.
+    let trailers_only = resp_headers.contains_key("grpc-status");
 
     let mut out = Response::builder().status(StatusCode::OK).header(http::header::CONTENT_TYPE, CT_PROTO);
-    if let Some(headers) = out.headers_mut() {
-        metadata::merge_metadata_into_headers(&MetadataMap::from_headers(resp_parts.headers.clone()), headers);
+    if !trailers_only {
+        if let Some(headers) = out.headers_mut() {
+            metadata::merge_metadata_into_headers(&MetadataMap::from_headers(resp_headers.clone()), headers);
+        }
     }
-
-    let resp_headers = resp_parts.headers;
     let deadline_at = deadline.map(|d| tokio::time::Instant::now() + d);
     let stream = async_stream::try_stream! {
         let mut skip = 1usize; // drop the gRPC compression-flag byte
@@ -299,10 +303,16 @@ async fn unary_proto(rt: &Runtime, req: Request<Incoming>) -> Response<ResBody> 
         } else {
             metadata::read_status(&trailer_headers, &resp_headers)
         };
+        // Trailers-only: the trailing metadata rode in the headers block, not a trailers block.
+        let trailing = if trailer_headers.is_empty() && trailers_only {
+            resp_headers.clone()
+        } else {
+            trailer_headers
+        };
         let trailer = Trailer {
             status_code,
             status_message,
-            trailers: metadata::metadata_to_vec(&MetadataMap::from_headers(trailer_headers)),
+            trailers: metadata::metadata_to_vec(&MetadataMap::from_headers(trailing)),
         };
         yield BodyFrame::data(encode_trailer_block(&trailer));
     };

@@ -66,14 +66,15 @@ cases:
       status: { code: 0 }
       message_count: 2
 
-  # Client cancels mid-stream: the server must observe a Reset (CANCELLED) and stop.
-  # `cancel_after_messages` tells the driver to Reset the stream after N received.
+  # Client cancels mid-stream: the server echoes the first message, the client cancels
+  # after receiving it (leaving the stream open), and the server observes a Reset.
+  # `cancel_after_messages` tells the driver to cancel after N received messages.
   - name: bidi/client-cancel
     rpc: BidiStream
     transports: [websocket]
     codecs: [proto]
     cancel_after_messages: 1
     requests:
-      - { payload: { text: "a" }, response_definition: { stream_messages: [ { payload: { text: "a" } }, { payload: { text: "b" } } ] } }
+      - { payload: { text: "a" } }
     expect:
       status: { code: 1 }         # CANCELLED
