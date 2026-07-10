@@ -415,7 +415,7 @@ async fn ws_subprotocol_pins_codec_to_json() {
 
     // A binary frame first would normally lock to proto, but the subprotocol pinned
     // JSON up front, so it is dropped.
-    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".as_slice().into() }))).await.unwrap();
+    ws.send(bin(Kind::Message(WsMessage { payload: b"junk".as_slice().into() }))).await.unwrap();
     // Text opens the stream and echoes.
     ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
     ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
@@ -448,7 +448,7 @@ async fn ws_locks_to_text_on_first_text_frame() {
     // First frame text -> locked to JSON; opens the single stream.
     ws.send(text(serde_json::json!({ "message": {"message": "a"} }))).await.unwrap();
     // A later binary frame must be dropped (locked to text).
-    ws.send(bin(Kind::Message(WsMessage { stream_id: 1, payload: b"junk".as_slice().into() }))).await.unwrap();
+    ws.send(bin(Kind::Message(WsMessage { payload: b"junk".as_slice().into() }))).await.unwrap();
     ws.send(text(serde_json::json!({ "halfClose": true }))).await.unwrap();
 
     let mut echoed = Vec::new();
@@ -478,7 +478,6 @@ async fn ws_locks_to_binary_on_first_binary_frame() {
 
     // First frame binary -> locked to protobuf; opens the stream (method from URL).
     ws.send(bin(Kind::Subscribe(Subscribe {
-        stream_id: 1,
         method: String::new(), // ignored in single-stream mode; taken from the URL
         headers: vec![],
         timeout_millis: 0,
@@ -489,7 +488,7 @@ async fn ws_locks_to_binary_on_first_binary_frame() {
     .unwrap();
     // A later text frame must be dropped (locked to binary).
     ws.send(text(serde_json::json!({ "message": {"message": "b"} }))).await.unwrap();
-    ws.send(bin(Kind::HalfClose(HalfClose { stream_id: 1 }))).await.unwrap();
+    ws.send(bin(Kind::HalfClose(HalfClose {}))).await.unwrap();
 
     let mut echoed = Vec::new();
     while let Some(msg) = ws.next().await {
@@ -597,39 +596,4 @@ async fn ws_annotation_accepts_grpc_webnext_json() {
         }
     }
     assert_eq!(got, vec!["hi", "hi"]);
-}
-
-#[tokio::test]
-async fn ws_multiplex_two_streams() {
-    // `+multi`: one socket carries two concurrent streams; frames carry streamId + method.
-    let base = start_json_server().await;
-    let url = base.replacen("http", "ws", 1); // base URL (not a method) for multiplexing
-    let mut ws = ws_connect(&url, Some("grpc-webnext+json+multi")).await;
-
-    for (sid, msg) in [(1, "one"), (2, "two")] {
-        ws.send(text(serde_json::json!({
-            "streamId": sid, "method": "/echo.v1.Echo/Stream", "message": {"message": msg}
-        })))
-        .await
-        .unwrap();
-        ws.send(text(serde_json::json!({ "streamId": sid, "halfClose": true }))).await.unwrap();
-    }
-
-    let mut got: std::collections::HashMap<u64, String> = Default::default();
-    let mut done = 0;
-    while let Some(msg) = ws.next().await {
-        let TungMessage::Text(t) = msg.unwrap() else { continue };
-        let jf: serde_json::Value = serde_json::from_str(&t).unwrap();
-        let sid = jf["streamId"].as_u64().unwrap();
-        if jf.get("status").is_some() {
-            done += 1;
-            if done == 2 {
-                break;
-            }
-        } else if let Some(m) = jf.get("message") {
-            got.insert(sid, m["message"].as_str().unwrap().to_string());
-        }
-    }
-    assert_eq!(got.get(&1).map(String::as_str), Some("one"));
-    assert_eq!(got.get(&2).map(String::as_str), Some("two"));
 }

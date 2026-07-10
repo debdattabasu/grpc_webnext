@@ -25,9 +25,8 @@ use tonic::Status;
 
 use crate::ws::{self, WsParams};
 use crate::{
-    query_param, ws_bearer_token, ws_subprotocols, BoxError, ResBody, Runtime, CT_GRPC, CT_JSON,
-    CT_PROTO, DEADLINE_GRACE, WS_SUBPROTOCOL, WS_SUBPROTOCOL_JSON, WS_SUBPROTOCOL_JSON_MULTI,
-    WS_SUBPROTOCOL_PROTO, WS_SUBPROTOCOL_PROTO_MULTI,
+    ws_bearer_token, ws_subprotocols, BoxError, ResBody, Runtime, CT_GRPC, CT_JSON, CT_PROTO,
+    DEADLINE_GRACE, WS_SUBPROTOCOL, WS_SUBPROTOCOL_JSON, WS_SUBPROTOCOL_PROTO,
 };
 
 /// Route one inbound HTTP request.
@@ -108,7 +107,7 @@ async fn passthrough(rt: &Runtime, req: Request<Incoming>) -> Response<ResBody> 
     }
 }
 
-/// The WebSocket handshake: resolve codec/multiplex + REST annotation, run the connection
+/// The WebSocket handshake: resolve codec + REST annotation, run the connection
 /// gate, then upgrade and hand off to `ws::serve`.
 async fn handle_ws_upgrade(rt: &Runtime, mut req: Request<Incoming>) -> Response<ResBody> {
     let offered = ws_subprotocols(req.headers());
@@ -122,18 +121,14 @@ async fn handle_ws_upgrade(rt: &Runtime, mut req: Request<Incoming>) -> Response
 
     let has = |s: &str| offered.iter().any(|p| p == s);
     // `explicit` = a grpc-webnext codec subprotocol was offered (main-endpoint OK).
-    let (codec, multi, explicit) = if has(WS_SUBPROTOCOL_PROTO_MULTI) {
-        (Some(false), true, true)
-    } else if has(WS_SUBPROTOCOL_JSON_MULTI) {
-        (Some(true), true, true)
-    } else if has(WS_SUBPROTOCOL_PROTO) {
-        (Some(false), false, true)
+    let (codec, explicit) = if has(WS_SUBPROTOCOL_PROTO) {
+        (Some(false), true)
     } else if has(WS_SUBPROTOCOL_JSON) {
-        (Some(true), false, true)
+        (Some(true), true)
     } else if has("application/json") {
-        (Some(true), false, false)
+        (Some(true), false)
     } else {
-        (None, false, false)
+        (None, false)
     };
 
     // Annotation route: the WS URL matches a `google.api.http` binding.
@@ -142,13 +137,12 @@ async fn handle_ws_upgrade(rt: &Runtime, mut req: Request<Incoming>) -> Response
         Err(_) => None,
     };
 
-    // Surface gating (see PROTOCOL.md): REST routes are single-stream JSON; main routes
-    // need a grpc-webnext codec subprotocol unless implicit codecs are allowed.
+    // Surface gating (see PROTOCOL.md): REST routes are JSON-only; main routes need a
+    // grpc-webnext codec subprotocol unless implicit codecs are allowed.
     let codec_reject = if ws_annotation.is_some() {
-        let proto = codec == Some(false);
-        (proto || multi).then(|| {
+        (codec == Some(false)).then(|| {
             Status::failed_precondition(
-                "REST WebSocket routes are single-stream JSON: use a blank, application/json, or grpc-webnext+json subprotocol",
+                "REST WebSocket routes are JSON: use a blank, application/json, or grpc-webnext+json subprotocol",
             )
         })
     } else if explicit {
@@ -158,50 +152,33 @@ async fn handle_ws_upgrade(rt: &Runtime, mut req: Request<Incoming>) -> Response
             Status::unimplemented("this websocket requires a grpc-webnext+proto or grpc-webnext+json subprotocol")
         })
     };
-    // Connection auth gate — only when the server does connect auth and the client
-    // presented a `bearer.*` credential.
+    // Connection auth gate — only when the server does connect auth and the client presented
+    // a `bearer.*` credential. Single-stream: the method is the WS URL path (or annotation).
     let auth_reject = match &rt.cfg.connect_auth {
         Some(auth) if ws_bearer_token(req.headers()).is_some() => {
-            let auth_method = if let Some(ann) = &ws_annotation {
-                Some(ann.grpc_method().to_string())
-            } else if !multi {
-                Some(req.uri().path().to_string())
-            } else {
-                query_param(req.uri().query(), "method")
+            let auth_method = match &ws_annotation {
+                Some(ann) => ann.grpc_method().to_string(),
+                None => req.uri().path().to_string(),
             };
-            match auth_method {
-                Some(m) => auth(&m, req.headers()).err(),
-                None => Some(Status::failed_precondition(
-                    "a multiplexed WebSocket carrying an auth subprotocol must pass ?method=",
-                )),
-            }
+            auth(&auth_method, req.headers()).err()
         }
         _ => None,
     };
     let reject = auth_reject.or(codec_reject);
 
-    let echo = [
-        WS_SUBPROTOCOL_PROTO_MULTI,
-        WS_SUBPROTOCOL_JSON_MULTI,
-        WS_SUBPROTOCOL_PROTO,
-        WS_SUBPROTOCOL_JSON,
-        WS_SUBPROTOCOL,
-        "application/json",
-    ]
-    .into_iter()
-    .find(|&p| has(p));
+    let echo = [WS_SUBPROTOCOL_PROTO, WS_SUBPROTOCOL_JSON, WS_SUBPROTOCOL, "application/json"]
+        .into_iter()
+        .find(|&p| has(p));
 
     let params = match &ws_annotation {
         Some(ann) => WsParams {
             codec: Some(true),
-            multi: false,
             method: Some(ann.grpc_method().to_string()),
             annotation: ws_annotation.clone(),
         },
         None => WsParams {
             codec,
-            multi,
-            method: (!multi).then(|| req.uri().path().to_string()),
+            method: Some(req.uri().path().to_string()),
             annotation: None,
         },
     };
@@ -323,7 +300,6 @@ async fn unary_proto(rt: &Runtime, req: Request<Incoming>) -> Response<ResBody> 
             metadata::read_status(&trailer_headers, &resp_headers)
         };
         let trailer = Trailer {
-            stream_id: 0,
             status_code,
             status_message,
             trailers: metadata::metadata_to_vec(&MetadataMap::from_headers(trailer_headers)),
@@ -469,7 +445,7 @@ pub(crate) fn webnext_error(content_type: &str, code: Code, message: &str) -> Re
     if is_json_ct(content_type) {
         return json_fetch_response(content_type, Bytes::new(), code as u32, message, &HeaderMap::new(), &HeaderMap::new());
     }
-    let trailer = Trailer { stream_id: 0, status_code: code as u32, status_message: message.to_string(), trailers: Vec::new() };
+    let trailer = Trailer { status_code: code as u32, status_message: message.to_string(), trailers: Vec::new() };
     let framed = encode_response_body(&[], &trailer);
     Response::builder()
         .status(StatusCode::OK)
@@ -509,7 +485,7 @@ fn json_fetch_response(
 /// A buffered `+proto` Fetch response carrying only a status (empty message block +
 /// trailer), for failures before any response body is available.
 fn fetch_status(code: Code, message: &str) -> Response<ResBody> {
-    let trailer = Trailer { stream_id: 0, status_code: code as u32, status_message: message.to_string(), trailers: Vec::new() };
+    let trailer = Trailer { status_code: code as u32, status_message: message.to_string(), trailers: Vec::new() };
     Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, CT_PROTO)

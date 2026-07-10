@@ -3,15 +3,19 @@ syntax = "proto3";
 package grpc.webnext.v1;
 
 // ============================================================================
-// grpc-webnext WebSocket wire format.
+// grpc-webnext WebSocket wire format — the custom `Frame` path (JSON always;
+// binary when the client selects `streaming: "ws"`).
 //
-// Rules (see PROTOCOL.md):
+// One WebSocket carries exactly ONE gRPC stream. The first frame is a Subscribe
+// (the method comes from the WS URL); then Message / HalfClose / Reset flow on
+// the same socket, and the server replies Header, Message(s), Trailer / Reset.
+// There is no multiplexing — no stream_id, no pool. (The binary default runs
+// real HTTP/2 over h2ts instead; see doc/H2TS_INTEGRATION.md.)
+//
+// Rules (see spec/PROTOCOL.md):
 //   * Exactly one Frame per WebSocket message. No fragmentation.
-//   * stream_id identifies a logical gRPC call. It is present on every stream
-//     frame so that single-WS-per-stream and multiplexed-pool modes share one
-//     wire format. In single-stream mode it is still set (typically 1).
-//   * No capability negotiation: if a server has a feature disabled and a
-//     client opens a new stream that needs it, the server answers with Reset.
+//   * No capability negotiation: if a server has a feature disabled and the
+//     client opens a stream that needs it, the server answers with Reset.
 // ============================================================================
 
 // A single WebSocket message. Exactly one field of `kind` is set.
@@ -24,11 +28,11 @@ message Frame {
   reserved 6, 7;
   reserved "ping", "pong";
   oneof kind {
-    Subscribe subscribe = 1;   // open a stream (client -> server)
+    Subscribe subscribe = 1;   // open the stream (client -> server)
     Message   message   = 2;   // one gRPC message, either direction
     HalfClose half_close = 3;  // client done sending (client -> server)
     Trailer   trailer   = 4;   // stream end + status (server -> client)
-    Reset     reset     = 5;   // abort a single stream, either direction
+    Reset     reset     = 5;   // abort the stream, either direction
     Header    header    = 8;   // initial response metadata (server -> client)
   }
 }
@@ -42,43 +46,36 @@ message Metadatum {
   }
 }
 
-// Open a new logical stream on this WebSocket. First frame of every call.
+// Open the stream. The first frame of the connection.
 message Subscribe {
-  uint32 stream_id = 1;              // unique per WebSocket, client-allocated
-  string method = 2;                 // e.g. "/pkg.Service/Method"
-  repeated Metadatum headers = 3;    // request metadata
-  uint32 timeout_millis = 4;         // gRPC deadline; 0 = none
-  bytes  initial_payload = 5;        // optional first message (unary-style)
-  bool   json = 6;                   // payloads are JSON (+json codec) not binary
+  string method = 1;                 // e.g. "/pkg.Service/Method"
+  repeated Metadatum headers = 2;    // request metadata
+  uint32 timeout_millis = 3;         // gRPC deadline; 0 = none
+  bytes  initial_payload = 4;        // optional first message (unary-style)
+  bool   json = 5;                   // payloads are JSON (+json codec) not binary
 }
 
 // Initial response metadata, sent once before the first Message (if any).
 message Header {
-  uint32 stream_id = 1;
-  repeated Metadatum headers = 2;
+  repeated Metadatum headers = 1;
 }
 
 message Message {
-  uint32 stream_id = 1;
-  bytes  payload   = 2;              // a single encoded gRPC message
+  bytes payload = 1;                 // a single encoded gRPC message
 }
 
-message HalfClose {
-  uint32 stream_id = 1;
-}
+// Client is done sending (a bare marker).
+message HalfClose {}
 
 // Stream completed. Carries gRPC status and trailing metadata.
 message Trailer {
-  uint32 stream_id = 1;
-  uint32 status_code = 2;            // gRPC status code (0 = OK)
-  string status_message = 3;
-  repeated Metadatum trailers = 4;
+  uint32 status_code = 1;            // gRPC status code (0 = OK)
+  string status_message = 2;
+  repeated Metadatum trailers = 3;
 }
 
-// Abort one stream without affecting the rest of the WebSocket. Also used by
-// the server to reject a stream (e.g. feature disabled) — no prior negotiation.
+// Abort the stream. Also used by the server to reject it (e.g. feature disabled).
 message Reset {
-  uint32 stream_id = 1;
-  uint32 status_code = 2;            // gRPC status code (e.g. CANCELLED, UNIMPLEMENTED)
-  string status_message = 3;
+  uint32 status_code = 1;            // gRPC status code (e.g. CANCELLED, UNIMPLEMENTED)
+  string status_message = 2;
 }

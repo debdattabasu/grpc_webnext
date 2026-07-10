@@ -31,7 +31,6 @@ async fn reset_cancels_in_process_handler() {
         .unwrap();
 
     ws.send(frame(Kind::Subscribe(Subscribe {
-        stream_id: 1,
         method: "/echo.v1.Echo/Hang".into(),
         headers: vec![],
         timeout_millis: 0,
@@ -40,7 +39,7 @@ async fn reset_cancels_in_process_handler() {
     })))
     .await
     .unwrap();
-    ws.send(frame(Kind::HalfClose(HalfClose { stream_id: 1 })))
+    ws.send(frame(Kind::HalfClose(HalfClose {})))
         .await
         .unwrap();
 
@@ -61,7 +60,6 @@ async fn reset_cancels_in_process_handler() {
     assert!(cancel_rx.try_recv().is_err(), "cancelled before reset");
 
     ws.send(frame(Kind::Reset(Reset {
-        stream_id: 1,
         status_code: 1,
         status_message: "cancelled".into(),
     })))

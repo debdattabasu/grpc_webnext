@@ -94,8 +94,8 @@ grammar. Current coverage:
 | limits | [cases/limits.yaml](cases/limits.yaml) | oversize response → RESOURCE_EXHAUSTED, `+json` w/o transcoder → UNIMPLEMENTED, ASCII+`-bin` metadata round-trip |
 
 **Not yet covered** (tracked, not silently omitted): WebSocket keepalive/idle-timeout,
-stream multiplexing over a pool, connection-level auth (Subscribe rejection), REST/HttpRule
-transcoding routes, half-close ordering edge cases, trailers-only responses. Add these as
+connection-level auth (Subscribe rejection), REST/HttpRule transcoding routes, half-close
+ordering edge cases, trailers-only responses. Add these as
 new suites; extend the table above when you do.
 
 ## Running (once a harness exists)

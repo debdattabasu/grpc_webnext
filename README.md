@@ -84,11 +84,16 @@ let (addr, handle) = bind_and_serve_in_process(routes, ServerConfig::default()).
 
 ## How it works
 
-- **Unary → Fetch.** Browsers can't read HTTP trailers, so the response body is
-  `[u32 len | message][u32 len | trailer]`; the trailer block carries gRPC status.
-- **Streaming → WebSocket.** One protobuf `Frame` per WebSocket message
+- **Binary (default) → real gRPC over h2ts.** The browser speaks real HTTP/2 — trailers,
+  flow control, native multiplexing — tunneled over a WebSocket by
+  [h2ts](https://github.com/debdattabasu/h2ts), and the server is unmodified tonic behind
+  an h2ts gateway. Real gRPC end to end, no translation. Transport is a per-client config
+  `{ codec, unary, streaming }`; proto defaults to h2ts for both surfaces.
+- **JSON (and binary `streaming: "ws"`) → the custom protocol.** Unary → Fetch, with the
+  response body `[u32 len | message][u32 len | trailer]` (browsers can't read HTTP
+  trailers). Streaming → **one WebSocket per stream**, one protobuf `Frame` per message
   (`Subscribe` / `Message` / `HalfClose` / `Trailer` / `Reset` / `Header`), no
-  fragmentation. Optional client-side multiplexing of many streams over a pool.
+  fragmentation, plaintext JSON for browser debuggability.
 - **Same port.** `content-type` disambiguates `application/grpc` from
   `application/grpc-webnext+proto`; WebSocket arrives as an HTTP/1.1 upgrade. Both
   the proxy and the native server forward native `application/grpc` untouched, so
@@ -138,8 +143,8 @@ go/                    Go module (github.com/grpc-webnext/grpc-webnext/go)
 7. Frontend API mimics Node gRPC (need not be 1:1).
 8. Connection management, retry, deadline semantics match standard gRPC.
 9. Serve on the same port as native gRPC; content-type disambiguates.
-10. Optional client-side multiplexing of streams over a WebSocket pool.
-11. WebSocket multiplexing is strictly one message per WebSocket message (no HTTP/2-style fragmentation).
+10. Multiplexing: on the binary path, provided natively by HTTP/2 over h2ts (one WebSocket, many streams); the custom `Frame` path is one WebSocket per stream.
+11. On the custom `Frame` path, strictly one message per WebSocket message (no HTTP/2-style fragmentation); the binary path uses real HTTP/2 framing via h2ts.
 
 ## Development
 

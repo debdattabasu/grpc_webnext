@@ -29,57 +29,6 @@ async fn proxy_for_hang() -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) 
     (format!("ws://{proxy_addr}/echo.v1.Echo/Hang"), cancel_rx)
 }
 
-fn subscribe(stream_id: u32) -> TungMessage {
-    frame(Kind::Subscribe(Subscribe {
-        stream_id,
-        method: "/echo.v1.Echo/Hang".into(),
-        headers: vec![],
-        timeout_millis: 0,
-        initial_payload: EchoRequest { message: "go".into() }.encode_to_vec().into(),
-        json: false,
-    }))
-}
-
-#[tokio::test]
-async fn caps_concurrent_streams() {
-    let upstream_addr = testecho::spawn().await;
-    let (proxy_addr, _handle) = bind_and_serve_proxy(ProxyConfig {
-        upstream: format!("http://{upstream_addr}").parse().unwrap(),
-        max_concurrent_streams: 1,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-
-    // Two streams on one socket -> multiplexed (method comes from each Subscribe).
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut req = format!("ws://{proxy_addr}/").into_client_request().unwrap();
-    req.headers_mut()
-        .insert("sec-websocket-protocol", "grpc-webnext+proto+multi".parse().unwrap());
-    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-
-    // First stream is accepted (starts, emits a Message); second is rejected.
-    ws.send(subscribe(1)).await.unwrap();
-    ws.send(subscribe(2)).await.unwrap();
-
-    let mut got_reset_for_2 = false;
-    let _ = timeout(Duration::from_secs(5), async {
-        while let Some(msg) = ws.next().await {
-            if let Ok(TungMessage::Binary(data)) = msg {
-                if let Some(Kind::Reset(r)) = decode_frame(&data).unwrap().kind {
-                    if r.stream_id == 2 && r.status_code == 8 {
-                        // RESOURCE_EXHAUSTED
-                        got_reset_for_2 = true;
-                        return;
-                    }
-                }
-            }
-        }
-    })
-    .await;
-    assert!(got_reset_for_2, "second stream was not rejected with RESOURCE_EXHAUSTED");
-}
-
 /// Open the hanging server-stream and wait until it has started upstream (the
 /// first `Message` frame). Times out rather than hanging on failure.
 async fn open_and_await_start<S>(ws: &mut WebSocketStream<S>)
@@ -87,7 +36,6 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     ws.send(frame(Kind::Subscribe(Subscribe {
-        stream_id: 1,
         method: "/echo.v1.Echo/Hang".into(),
         headers: vec![],
         timeout_millis: 0,
@@ -96,7 +44,7 @@ where
     })))
     .await
     .unwrap();
-    ws.send(frame(Kind::HalfClose(HalfClose { stream_id: 1 })))
+    ws.send(frame(Kind::HalfClose(HalfClose {})))
         .await
         .unwrap();
 
@@ -123,7 +71,6 @@ async fn reset_propagates_to_upstream() {
     assert!(cancel_rx.try_recv().is_err(), "cancelled before reset");
 
     ws.send(frame(Kind::Reset(Reset {
-        stream_id: 1,
         status_code: 1, // CANCELLED
         status_message: "client cancelled".into(),
     })))

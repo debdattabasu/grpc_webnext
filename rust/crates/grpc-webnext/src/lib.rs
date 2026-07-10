@@ -69,8 +69,6 @@ pub(crate) const CT_GRPC: &str = "application/grpc";
 pub const WS_SUBPROTOCOL: &str = "grpc-webnext";
 pub const WS_SUBPROTOCOL_JSON: &str = "grpc-webnext+json";
 pub const WS_SUBPROTOCOL_PROTO: &str = "grpc-webnext+proto";
-pub const WS_SUBPROTOCOL_JSON_MULTI: &str = "grpc-webnext+json+multi";
-pub const WS_SUBPROTOCOL_PROTO_MULTI: &str = "grpc-webnext+proto+multi";
 
 /// The proxy owns the client-facing deadline: it drops the call at the deadline
 /// (surfacing DEADLINE_EXCEEDED) and forwards `grpc-timeout` downstream with this grace so
@@ -113,9 +111,6 @@ pub struct ServerConfig {
     pub ws_keepalive: Option<Duration>,
     /// Dead-peer timeout after a keepalive ping (gRPC's `keepalive_timeout`, default 20s).
     pub ws_keepalive_timeout: Duration,
-    /// Max concurrent logical streams per WebSocket connection. Defaults to `usize::MAX`
-    /// (no cap — a wrapped service serves one client per connection).
-    pub max_concurrent_streams: usize,
 }
 
 impl Default for ServerConfig {
@@ -128,7 +123,6 @@ impl Default for ServerConfig {
             allow_implicit_codec: false,
             ws_keepalive: None,
             ws_keepalive_timeout: Duration::from_secs(20),
-            max_concurrent_streams: usize::MAX,
         }
     }
 }
@@ -139,8 +133,6 @@ pub struct ProxyConfig {
     /// Upstream gRPC endpoint (e.g. `http://127.0.0.1:50051`).
     pub upstream: http::Uri,
     pub max_message_bytes: usize,
-    /// Max concurrent logical streams per WebSocket connection (default 100).
-    pub max_concurrent_streams: usize,
     pub ws_keepalive: Option<Duration>,
     pub ws_keepalive_timeout: Duration,
     /// Descriptor source for `+json` termination (`None` ⇒ binary-only).
@@ -158,7 +150,6 @@ impl Default for ProxyConfig {
         Self {
             upstream: http::Uri::default(),
             max_message_bytes: 4 * 1024 * 1024,
-            max_concurrent_streams: 100,
             ws_keepalive: None,
             ws_keepalive_timeout: Duration::from_secs(20),
             schema: SchemaSource::None,
@@ -175,7 +166,6 @@ impl Default for ProxyConfig {
 /// them.
 pub(crate) struct RunConfig {
     pub max_message_bytes: usize,
-    pub max_concurrent_streams: usize,
     pub ws_keepalive: Option<Duration>,
     pub ws_keepalive_timeout: Duration,
     pub allow_implicit_codec: bool,
@@ -206,7 +196,6 @@ pub async fn serve_in_process(
     let schema = Schema::from_transcoder(config.transcoder.clone());
     let cfg = Arc::new(RunConfig {
         max_message_bytes: config.max_message_bytes,
-        max_concurrent_streams: config.max_concurrent_streams,
         ws_keepalive: config.ws_keepalive,
         ws_keepalive_timeout: config.ws_keepalive_timeout,
         allow_implicit_codec: config.allow_implicit_codec,
@@ -237,7 +226,6 @@ pub async fn serve_proxy(listener: TcpListener, config: ProxyConfig) -> std::io:
     schema.start();
     let cfg = Arc::new(RunConfig {
         max_message_bytes: config.max_message_bytes,
-        max_concurrent_streams: config.max_concurrent_streams,
         ws_keepalive: config.ws_keepalive,
         ws_keepalive_timeout: config.ws_keepalive_timeout,
         allow_implicit_codec: config.allow_implicit_codec,
@@ -308,12 +296,4 @@ pub fn ws_bearer_token(headers: &HeaderMap) -> Option<String> {
     ws_subprotocols(headers)
         .into_iter()
         .find_map(|p| p.strip_prefix("bearer.").map(|t| t.to_string()))
-}
-
-/// Read a single query parameter's (percent-decoded) value.
-pub(crate) fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == key).then(|| crate::metadata::percent_decode(v))
-    })
 }

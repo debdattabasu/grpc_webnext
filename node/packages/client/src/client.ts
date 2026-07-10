@@ -42,10 +42,6 @@ export interface ClientOptions {
   fetch?: typeof fetch;
   /** Message codec: binary protobuf (default) or JSON. */
   codec?: Codec;
-  /** Multiplex streams over a pool of WebSockets. Off by default (one WS per stream). */
-  multiplex?: boolean;
-  /** WebSocket pool size when `multiplex` is set. Default 1. */
-  poolSize?: number;
   /**
    * Where unary calls go. Proto default `"h2ts"` (real gRPC over one HTTP/2 tunnel);
    * `"fetch"` uses the buffered-trailer Fetch path. Forced to `"fetch"` for `codec: "json"`.
@@ -131,8 +127,6 @@ export class Client {
             baseUrl: options.baseUrl,
             webSocketImpl: options.webSocketImpl,
             codec: options.codec,
-            multiplex: options.multiplex,
-            poolSize: options.poolSize,
           });
   }
 

@@ -89,31 +89,4 @@ describe("generated client -> proxy -> echo", () => {
     for await (const r of stream) got.push(r.message);
     expect(got).toEqual(["x", "y"]);
   });
-
-  it("multiplex: two concurrent streams share one socket", async () => {
-    const mux = makeClient(EchoDefinition, {
-      baseUrl,
-      multiplex: true,
-      unary: "fetch",
-      streaming: "ws",
-      webSocketImpl: WebSocket as unknown as typeof globalThis.WebSocket,
-    });
-    const run = (msgs: string[]) =>
-      new Promise<string[]>((resolve, reject) => {
-        const got: string[] = [];
-        const s = mux.stream();
-        s.on("data", (r) => got.push(r.message));
-        s.on("end", () => resolve(got));
-        s.on("error", reject);
-        for (const m of msgs) s.write({ message: m });
-        s.end();
-      });
-    try {
-      const [a, b] = await Promise.all([run(["a1", "a2"]), run(["b1", "b2"])]);
-      expect(a).toEqual(["a1", "a2"]);
-      expect(b).toEqual(["b1", "b2"]);
-    } finally {
-      mux.close();
-    }
-  });
 });

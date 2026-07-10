@@ -12,7 +12,6 @@ describe("frame codec", () => {
   it("round-trips a Subscribe frame", () => {
     const bytes = encodeFrame({
       subscribe: {
-        streamId: 7,
         method: "/echo.v1.Echo/Stream",
         headers: new Metadata().toMetadatumList(),
         timeoutMillis: 100,
@@ -20,7 +19,6 @@ describe("frame codec", () => {
       },
     });
     const frame = decodeFrame(bytes);
-    expect(frame.subscribe?.streamId).toBe(7);
     expect(frame.subscribe?.method).toBe("/echo.v1.Echo/Stream");
     expect(frame.subscribe?.initialPayload).toEqual(new Uint8Array([1, 2, 3]));
   });
@@ -28,7 +26,6 @@ describe("frame codec", () => {
   it("parses a Fetch response body (message + trailer)", () => {
     const message = new Uint8Array([9, 8, 7]);
     const trailer: Trailer = {
-      streamId: 0,
       statusCode: 0,
       statusMessage: "OK",
       trailers: [],

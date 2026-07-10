@@ -8,7 +8,6 @@ use grpc_webnext::{decode_response_body, encode_response_body, FetchError};
 #[test]
 fn round_trips_message_and_trailer() {
     let trailer = Trailer {
-        stream_id: 0,
         status_code: 0,
         status_message: "OK".into(),
         trailers: vec![Metadatum {

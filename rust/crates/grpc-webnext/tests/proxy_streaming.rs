@@ -28,7 +28,6 @@ async fn streaming_round_trip() {
 
     // Open the bidi stream, sending the first request as initial_payload.
     ws.send(frame(Kind::Subscribe(Subscribe {
-        stream_id: 1,
         method: "/echo.v1.Echo/Stream".into(),
         headers: vec![],
         timeout_millis: 0,
@@ -40,12 +39,11 @@ async fn streaming_round_trip() {
 
     // Second request message, then half-close.
     ws.send(frame(Kind::Message(WsMessage {
-        stream_id: 1,
         payload: EchoRequest { message: "b".into() }.encode_to_vec().into(),
     })))
     .await
     .unwrap();
-    ws.send(frame(Kind::HalfClose(HalfClose { stream_id: 1 })))
+    ws.send(frame(Kind::HalfClose(HalfClose {})))
         .await
         .unwrap();
 
@@ -58,16 +56,13 @@ async fn streaming_round_trip() {
         let TungMessage::Binary(data) = msg.unwrap() else { continue };
         let f = decode_frame(&data).unwrap();
         match f.kind.unwrap() {
-            Kind::Header(h) => {
-                assert_eq!(h.stream_id, 1);
+            Kind::Header(_) => {
                 got_header = true;
             }
             Kind::Message(m) => {
-                assert_eq!(m.stream_id, 1);
                 echoed.push(EchoResponse::decode(&m.payload[..]).unwrap().message);
             }
             Kind::Trailer(t) => {
-                assert_eq!(t.stream_id, 1);
                 status_code = Some(t.status_code);
                 break;
             }

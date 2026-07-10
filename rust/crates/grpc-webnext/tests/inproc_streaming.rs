@@ -28,7 +28,6 @@ async fn streaming_round_trip() {
         .unwrap();
 
     ws.send(frame(Kind::Subscribe(Subscribe {
-        stream_id: 1,
         method: "/echo.v1.Echo/Stream".into(),
         headers: vec![],
         timeout_millis: 0,
@@ -38,12 +37,11 @@ async fn streaming_round_trip() {
     .await
     .unwrap();
     ws.send(frame(Kind::Message(WsMessage {
-        stream_id: 1,
         payload: EchoRequest { message: "b".into() }.encode_to_vec().into(),
     })))
     .await
     .unwrap();
-    ws.send(frame(Kind::HalfClose(HalfClose { stream_id: 1 })))
+    ws.send(frame(Kind::HalfClose(HalfClose {})))
         .await
         .unwrap();
 

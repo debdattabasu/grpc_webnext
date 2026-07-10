@@ -1,5 +1,5 @@
 //! The WebSocket transport derives a connection-level `bearer.<token>` subprotocol
-//! from a call's `authorization` metadata (single-stream and each new pooled socket).
+//! from a call's `authorization` metadata (one WebSocket per stream, on the method URL).
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { Metadata, WebSocketTransport } from "../src/index.js";
@@ -51,21 +51,6 @@ describe("auth via WebSocket subprotocol", () => {
     expect(ws.url).toContain("/echo.v1.Echo/Stream");
     expect(ws.protocols).toContain("grpc-webnext+proto");
     expect(ws.protocols).toContain("bearer.abc.def-token");
-  });
-
-  it("multiplex with auth: new socket carries bearer + the opener's ?method=", () => {
-    start(new WebSocketTransport(opts({ multiplex: true })), md("Bearer tok123"));
-    const ws = MockWebSocket.instances[0];
-    expect(ws.protocols).toContain("grpc-webnext+proto+multi");
-    expect(ws.protocols).toContain("bearer.tok123");
-    expect(ws.url).toContain(`method=${encodeURIComponent("/echo.v1.Echo/Stream")}`);
-  });
-
-  it("multiplex without auth: base URL, no bearer, no ?method=", () => {
-    start(new WebSocketTransport(opts({ multiplex: true })), md());
-    const ws = MockWebSocket.instances[0];
-    expect(ws.protocols.some((p) => p.startsWith("bearer."))).toBe(false);
-    expect(ws.url).not.toContain("method=");
   });
 
   it("no authorization -> no bearer subprotocol", () => {

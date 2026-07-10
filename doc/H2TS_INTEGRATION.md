@@ -131,9 +131,11 @@ JSON differ only in payload encoding (protobuf frames vs plaintext JSON frames).
 - **Phase 2 — config knobs.** ✅ Per-client `{ codec, unary, streaming }`: proto defaults to
   `h2ts`/`h2ts`, `json` locked to `fetch`/`ws`, unsupported combos rejected. h2ts is now the
   proto default; `unary: "fetch"` / `streaming: "ws"` are the opt-outs.
-- **Phase 3 — retire multiplexing.** Delete `stream_id` + pool; collapse the `Frame` WS
-  handler (both codecs) to single-stream.
-- **Phase 4 — spec + conformance rework**, then the Go/Node h2ts gateways.
+- **Phase 3 — retire multiplexing.** ✅ `stream_id` deleted from the proto; the `+multi`
+  subprotocols, WS pool, and `max_concurrent_streams` removed across Rust + TS; the `Frame`
+  path is now strictly one WebSocket per stream (JSON always, binary `streaming: "ws"`).
+  Proto/spec/Go-placeholder updated. Rust 84 tests + clippy clean; TS 47 tests.
+- **Phase 4 — conformance rework**, then the Go/Node h2ts gateways.
 
 ## Decisions (locked 2026-07-07)
 

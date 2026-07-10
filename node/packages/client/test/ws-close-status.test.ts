@@ -61,66 +61,46 @@ describe("status reconstruction from WebSocket close", () => {
     MockWebSocket.instances = [];
   });
 
-  for (const multiplex of [false, true]) {
-    const label = multiplex ? "multiplex" : "single-stream";
-
-    it(`${label}: a private 4000+code close becomes that gRPC status with the reason`, () => {
-      const { ws, status } = startCapturing({ multiplex }, "Bearer bad");
-      ws.emit("close", { code: 4000 + Status.UNAUTHENTICATED, reason: "bad token" });
-      expect(status()).toEqual({
-        code: Status.UNAUTHENTICATED,
-        details: "bad token",
-        metadata: new Metadata(),
-      });
+  it("a private 4000+code close becomes that gRPC status with the reason", () => {
+    const { ws, status } = startCapturing({}, "Bearer bad");
+    ws.emit("close", { code: 4000 + Status.UNAUTHENTICATED, reason: "bad token" });
+    expect(status()).toEqual({
+      code: Status.UNAUTHENTICATED,
+      details: "bad token",
+      metadata: new Metadata(),
     });
+  });
 
-    it(`${label}: FAILED_PRECONDITION (4009) round-trips`, () => {
-      const { ws, status } = startCapturing({ multiplex });
-      ws.emit("close", { code: 4000 + Status.FAILED_PRECONDITION, reason: "no codec" });
-      expect(status()?.code).toBe(Status.FAILED_PRECONDITION);
-      expect(status()?.details).toBe("no codec");
-    });
+  it("FAILED_PRECONDITION (4009) round-trips", () => {
+    const { ws, status } = startCapturing();
+    ws.emit("close", { code: 4000 + Status.FAILED_PRECONDITION, reason: "no codec" });
+    expect(status()?.code).toBe(Status.FAILED_PRECONDITION);
+    expect(status()?.details).toBe("no codec");
+  });
 
-    it(`${label}: a normal 1000 close is UNAVAILABLE`, () => {
-      const { ws, status } = startCapturing({ multiplex });
-      ws.emit("close", { code: 1000, reason: "" });
-      expect(status()?.code).toBe(Status.UNAVAILABLE);
-      expect(status()?.details).toBe("websocket closed");
-    });
+  it("a normal 1000 close is UNAVAILABLE", () => {
+    const { ws, status } = startCapturing();
+    ws.emit("close", { code: 1000, reason: "" });
+    expect(status()?.code).toBe(Status.UNAVAILABLE);
+    expect(status()?.details).toBe("websocket closed");
+  });
 
-    it(`${label}: an abnormal 1006 close is UNAVAILABLE`, () => {
-      const { ws, status } = startCapturing({ multiplex });
-      ws.emit("close", { code: 1006, reason: "" });
-      expect(status()?.code).toBe(Status.UNAVAILABLE);
-    });
+  it("an abnormal 1006 close is UNAVAILABLE", () => {
+    const { ws, status } = startCapturing();
+    ws.emit("close", { code: 1006, reason: "" });
+    expect(status()?.code).toBe(Status.UNAVAILABLE);
+  });
 
-    it(`${label}: an error event (no CloseEvent) is UNAVAILABLE`, () => {
-      const { ws, status } = startCapturing({ multiplex });
-      ws.emit("error");
-      expect(status()?.code).toBe(Status.UNAVAILABLE);
-    });
+  it("an error event (no CloseEvent) is UNAVAILABLE", () => {
+    const { ws, status } = startCapturing();
+    ws.emit("error");
+    expect(status()?.code).toBe(Status.UNAVAILABLE);
+  });
 
-    it(`${label}: a code just past the gRPC range (4017) is UNAVAILABLE`, () => {
-      const { ws, status } = startCapturing({ multiplex });
-      ws.emit("close", { code: 4017, reason: "out of range" });
-      expect(status()?.code).toBe(Status.UNAVAILABLE);
-    });
-  }
-
-  it("multiplex: a socket close fans the status out to every open stream", () => {
-    const transport = new WebSocketTransport(opts({ multiplex: true }));
-    const got: StatusResult[] = [];
-    for (let i = 0; i < 3; i++) {
-      transport.startStream("/echo.v1.Echo/Stream", { metadata: md() }, { onStatus: (s) => got.push(s) });
-    }
-    // poolSize defaults to 1, so all three streams share one socket.
-    expect(MockWebSocket.instances).toHaveLength(1);
-    MockWebSocket.instances[0].emit("close", { code: 4000 + Status.UNAUTHENTICATED, reason: "bad token" });
-    expect(got).toHaveLength(3);
-    for (const s of got) {
-      expect(s.code).toBe(Status.UNAUTHENTICATED);
-      expect(s.details).toBe("bad token");
-    }
+  it("a code just past the gRPC range (4017) is UNAVAILABLE", () => {
+    const { ws, status } = startCapturing();
+    ws.emit("close", { code: 4017, reason: "out of range" });
+    expect(status()?.code).toBe(Status.UNAVAILABLE);
   });
 });
 

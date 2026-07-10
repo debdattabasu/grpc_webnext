@@ -1,10 +1,10 @@
-//! WebSocket streaming path, shared by both surfaces.
+//! WebSocket streaming path (the custom `Frame` protocol), shared by both surfaces.
 //!
-//! Each `Subscribe` opens a gRPC streaming call through the [`Backend`] (a local router or
-//! a remote channel); request messages are fed in from WS frames and the response is
-//! de-framed back into WS frames. Exactly one `Frame` per WebSocket message.
+//! One WebSocket carries exactly ONE gRPC stream. The first frame is a `Subscribe`
+//! (method from the WS URL); request messages are fed in from later WS frames and the
+//! response is de-framed back into WS frames. Exactly one `Frame` per WebSocket message.
+//! (The binary default runs real HTTP/2 over h2ts instead; see `crate::h2ts`.)
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -43,9 +43,7 @@ pub(crate) struct WsParams {
     /// `Some(true)` = JSON/text, `Some(false)` = proto/binary, `None` = infer from the
     /// first frame (only reachable with implicit codecs).
     pub codec: Option<bool>,
-    /// Multiplexing enabled (`+multi`): streams carry `stream_id`/`method`.
-    pub multi: bool,
-    /// Single-stream mode only: the gRPC method from the WS URL path.
+    /// The gRPC method from the WS URL path (the one stream's route).
     pub method: Option<String>,
     /// Annotation route: the WS URL matched a `google.api.http` binding.
     pub annotation: Option<Arc<WsBinding>>,
@@ -73,10 +71,9 @@ pub(crate) async fn serve(rt: Runtime, websocket: HyperWebsocket, reject: Option
         return;
     }
 
-    // Ready-to-send WebSocket messages: each stream encodes in its own codec before sending,
-    // which is what lets a connection whose codec is inferred from the first frame work.
+    // Ready-to-send WebSocket messages: each frame encodes in the connection codec before
+    // sending, which is what lets a connection whose codec is inferred from the first frame work.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<TungMessage>(64);
-    let (done_tx, mut done_rx) = mpsc::channel::<u32>(64);
 
     let writer = tokio::spawn(async move {
         let mut ping = keepalive.map(keepalive_interval);
@@ -93,19 +90,18 @@ pub(crate) async fn serve(rt: Runtime, websocket: HyperWebsocket, reject: Option
         }
     });
 
-    let multi = params.multi;
     let annotation = params.annotation;
     let method_url = params.method.unwrap_or_default();
-    let mut streams: HashMap<u32, StreamState> = HashMap::new();
     // Connection codec (true = JSON/text, false = proto/binary). A codec subprotocol pins
     // it up front; otherwise (implicit) it locks to the first frame's type.
     let mut codec: Option<bool> = params.codec;
     let mut opened = false;
+    // The single stream on this connection.
+    let mut stream: Option<StreamState> = None;
     let mut deadline = max_silence.map(|d| tokio::time::Instant::now() + d);
 
     loop {
         tokio::select! {
-            Some(stream_id) = done_rx.recv() => { streams.remove(&stream_id); }
             _ = sleep_until(deadline) => {
                 tracing::debug!("ws keepalive: no pong within timeout; dropping connection");
                 break;
@@ -119,59 +115,51 @@ pub(crate) async fn serve(rt: Runtime, websocket: HyperWebsocket, reject: Option
                 let decoded = match msg {
                     TungMessage::Binary(data) => {
                         if *codec.get_or_insert(false) { continue } // locked to JSON/text
-                        decode_binary(&data, multi, &method_url, &mut opened).map(|f| (f, false))
+                        decode_binary(&data, &method_url, &mut opened).map(|f| (f, false))
                     }
                     TungMessage::Text(text) => {
                         if !*codec.get_or_insert(true) { continue } // locked to proto/binary
-                        decode_text(&text, multi, &method_url, &mut opened).map(|f| (f, true))
+                        decode_text(&text, &method_url, &mut opened).map(|f| (f, true))
                     }
                     TungMessage::Close(_) => break,
                     _ => continue,
                 };
                 let Some((frame, json)) = decoded else { continue };
-                handle_frame(&rt, frame, json, multi, &annotation, &outbound_tx, &done_tx, &mut streams).await;
+                handle_frame(&rt, frame, json, &annotation, &outbound_tx, &mut stream).await;
             }
         }
     }
 
-    for (_, state) in streams.drain() {
+    if let Some(state) = stream {
         state.task.abort();
     }
     drop(outbound_tx);
     let _ = writer.await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     rt: &Runtime,
     frame: Frame,
     json: bool,
-    multi: bool,
     annotation: &Option<Arc<WsBinding>>,
     outbound_tx: &mpsc::Sender<TungMessage>,
-    done_tx: &mpsc::Sender<u32>,
-    streams: &mut HashMap<u32, StreamState>,
+    stream: &mut Option<StreamState>,
 ) {
     match frame.kind {
         Some(Kind::Subscribe(sub)) => {
-            let stream_id = sub.stream_id;
-            if streams.contains_key(&stream_id) {
-                send_reset(outbound_tx, stream_id, json, multi, Code::InvalidArgument, "stream_id already in use").await;
-                return;
-            }
-            if streams.len() >= rt.cfg.max_concurrent_streams {
-                send_reset(outbound_tx, stream_id, json, multi, Code::ResourceExhausted, "too many concurrent streams").await;
+            if stream.is_some() {
+                send_reset(outbound_tx, json, Code::InvalidArgument, "stream already open").await;
                 return;
             }
             // An opening frame may carry the first message inline; hold it to the size limit.
             if sub.initial_payload.len() > rt.cfg.max_message_bytes {
-                send_reset(outbound_tx, stream_id, json, multi, Code::ResourceExhausted, "request message exceeds size limit").await;
+                send_reset(outbound_tx, json, Code::ResourceExhausted, "request message exceeds size limit").await;
                 return;
             }
             let path: PathAndQuery = match sub.method.parse() {
                 Ok(p) => p,
                 Err(_) => {
-                    send_reset(outbound_tx, stream_id, json, multi, Code::InvalidArgument, "invalid method").await;
+                    send_reset(outbound_tx, json, Code::InvalidArgument, "invalid method").await;
                     return;
                 }
             };
@@ -179,7 +167,7 @@ async fn handle_frame(
             let md = metadata::metadata_vec_to_metadata(&sub.headers);
             if let Some(auth) = &rt.cfg.stream_auth {
                 if let Err(status) = auth(&sub.method, &md) {
-                    send_reset(outbound_tx, stream_id, json, multi, status.code(), status.message()).await;
+                    send_reset(outbound_tx, json, status.code(), status.message()).await;
                     return;
                 }
             }
@@ -201,33 +189,31 @@ async fn handle_frame(
             let headers = md.into_headers();
             let timeout = metadata::grpc_timeout_from_millis(sub.timeout_millis);
             let task = tokio::spawn(run_stream(
-                rt.clone(), path, headers, timeout, req_rx, stream_id,
-                outbound_tx.clone(), done_tx.clone(), json, multi, annotation.clone(),
+                rt.clone(), path, headers, timeout, req_rx, outbound_tx.clone(), json, annotation.clone(),
             ));
-            streams.insert(stream_id, StreamState { req_tx: req_tx_state, task });
+            *stream = Some(StreamState { req_tx: req_tx_state, task });
         }
         Some(Kind::Message(msg)) => {
             if msg.payload.len() > rt.cfg.max_message_bytes {
-                let stream_id = msg.stream_id;
-                send_reset(outbound_tx, stream_id, json, multi, Code::ResourceExhausted, "request message exceeds size limit").await;
-                if let Some(state) = streams.remove(&stream_id) {
+                send_reset(outbound_tx, json, Code::ResourceExhausted, "request message exceeds size limit").await;
+                if let Some(state) = stream.take() {
                     state.task.abort();
                 }
                 return;
             }
-            if let Some(state) = streams.get(&msg.stream_id) {
+            if let Some(state) = stream {
                 if let Some(tx) = &state.req_tx {
                     let _ = tx.send(msg.payload).await;
                 }
             }
         }
-        Some(Kind::HalfClose(hc)) => {
-            if let Some(state) = streams.get_mut(&hc.stream_id) {
+        Some(Kind::HalfClose(_)) => {
+            if let Some(state) = stream {
                 state.req_tx = None;
             }
         }
-        Some(Kind::Reset(rst)) => {
-            if let Some(state) = streams.remove(&rst.stream_id) {
+        Some(Kind::Reset(_)) => {
+            if let Some(state) = stream.take() {
                 state.task.abort();
             }
         }
@@ -242,11 +228,8 @@ async fn run_stream(
     headers: HeaderMap,
     timeout: Option<std::time::Duration>,
     req_rx: mpsc::Receiver<Bytes>,
-    stream_id: u32,
     outbound_tx: mpsc::Sender<TungMessage>,
-    done_tx: mpsc::Sender<u32>,
     json: bool,
-    multi: bool,
     annotation: Option<Arc<WsBinding>>,
 ) {
     let method_path = path.path().to_string();
@@ -258,8 +241,7 @@ async fn run_stream(
         match rt.schema.transcoder(&method_path).await {
             Ok(tc) => Some(tc),
             Err(status) => {
-                send_reset(&outbound_tx, stream_id, json, multi, status.code(), status.message()).await;
-                let _ = done_tx.send(stream_id).await;
+                send_reset(&outbound_tx, json, status.code(), status.message()).await;
                 return;
             }
         }
@@ -301,17 +283,16 @@ async fn run_stream(
         let resp = match rt.backend.call(request).await {
             Ok(r) => r,
             Err(e) => {
-                send_reset(&outbound_tx, stream_id, json, multi, Code::Unavailable, &format!("upstream: {e}")).await;
+                send_reset(&outbound_tx, json, Code::Unavailable, &format!("upstream: {e}")).await;
                 return;
             }
         };
         let (parts, mut body) = resp.into_parts();
 
         let header = Header {
-            stream_id,
             headers: metadata::metadata_to_vec(&MetadataMap::from_headers(parts.headers.clone())),
         };
-        let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Header(header)) }, json, multi)).await;
+        let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Header(header)) }, json)).await;
 
         let mut deframer = Deframer::new();
         let mut trailers = HeaderMap::new();
@@ -328,17 +309,15 @@ async fn run_stream(
                         match transcoder.as_ref().unwrap().response_proto_to_json(&method_path, &msg) {
                             Ok(j) => j.into(),
                             Err(e) => {
-                                send_reset(&outbound_tx, stream_id, json, multi, Code::Internal, &format!("json encode: {e}")).await;
-                                let _ = done_tx.send(stream_id).await;
+                                send_reset(&outbound_tx, json, Code::Internal, &format!("json encode: {e}")).await;
                                 return;
                             }
                         }
                     } else {
                         msg
                     };
-                    let out = Frame { kind: Some(Kind::Message(WsMessage { stream_id, payload })) };
-                    if outbound_tx.send(to_tung(&out, json, multi)).await.is_err() {
-                        let _ = done_tx.send(stream_id).await;
+                    let out = Frame { kind: Some(Kind::Message(WsMessage { payload })) };
+                    if outbound_tx.send(to_tung(&out, json)).await.is_err() {
                         return;
                     }
                 }
@@ -351,47 +330,36 @@ async fn run_stream(
 
         let (status_code, status_message) = metadata::read_status(&trailers, &parts.headers);
         let trailer = Trailer {
-            stream_id,
             status_code,
             status_message,
             trailers: metadata::metadata_to_vec(&MetadataMap::from_headers(trailers)),
         };
-        let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Trailer(trailer)) }, json, multi)).await;
+        let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Trailer(trailer)) }, json)).await;
     };
 
     match timeout {
         Some(d) => {
             if tokio::time::timeout(d, pump).await.is_err() {
                 let trailer = Trailer {
-                    stream_id,
                     status_code: Code::DeadlineExceeded as u32,
                     status_message: "deadline exceeded".into(),
                     trailers: vec![],
                 };
-                let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Trailer(trailer)) }, json, multi)).await;
+                let _ = outbound_tx.send(to_tung(&Frame { kind: Some(Kind::Trailer(trailer)) }, json)).await;
             }
         }
         None => pump.await,
     }
-    let _ = done_tx.send(stream_id).await;
 }
 
-async fn send_reset(
-    outbound_tx: &mpsc::Sender<TungMessage>,
-    stream_id: u32,
-    json: bool,
-    multi: bool,
-    code: Code,
-    message: &str,
-) {
+async fn send_reset(outbound_tx: &mpsc::Sender<TungMessage>, json: bool, code: Code, message: &str) {
     let frame = Frame {
         kind: Some(Kind::Reset(Reset {
-            stream_id,
             status_code: code as u32,
             status_message: message.to_string(),
         })),
     };
-    let _ = outbound_tx.send(to_tung(&frame, json, multi)).await;
+    let _ = outbound_tx.send(to_tung(&frame, json)).await;
 }
 
 /// A close frame that carries a gRPC status to browser JS: private close code `4000 + code`
@@ -417,51 +385,40 @@ fn truncate_utf8(s: &str, max: usize) -> &str {
 }
 
 // --- Shared frame codec + keepalive helpers ---------------------------------
-// These were byte-identical copies in the old server/proxy crates; now single-source.
 
-/// Decode an inbound binary (proto) WebSocket frame into an internal `Frame`. In
-/// single-stream mode the stream is normalized to id `1` and a `Subscribe`'s method comes
-/// from the WS URL; a non-`Subscribe` before the stream opens is dropped.
-pub fn decode_binary(data: &[u8], multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+/// Decode an inbound binary (proto) WebSocket frame into an internal `Frame`. The first
+/// frame must be a `Subscribe` (its method comes from the WS URL); a non-`Subscribe` before
+/// the stream opens is dropped.
+pub fn decode_binary(data: &[u8], method_url: &str, opened: &mut bool) -> Option<Frame> {
     let mut frame = decode_frame(data).ok()?;
-    if multi {
-        return Some(frame);
-    }
     match frame.kind.as_mut()? {
         Kind::Subscribe(s) => {
-            s.stream_id = 1;
             s.method = method_url.to_string();
             *opened = true;
         }
         _ if !*opened => return None,
-        Kind::Message(m) => m.stream_id = 1,
-        Kind::HalfClose(h) => h.stream_id = 1,
-        Kind::Reset(r) => r.stream_id = 1,
         _ => {}
     }
     Some(frame)
 }
 
-/// Decode an inbound text (JSON) WebSocket frame. In single-stream mode the first frame
-/// opens the one stream (method from the URL); later frames are messages/half-close/reset.
-pub fn decode_text(text: &str, multi: bool, method_url: &str, opened: &mut bool) -> Option<Frame> {
+/// Decode an inbound text (JSON) WebSocket frame. The first frame opens the one stream
+/// (method from the URL); later frames are messages/half-close/reset.
+pub fn decode_text(text: &str, method_url: &str, opened: &mut bool) -> Option<Frame> {
     let jf = decode_json_frame(text).ok()?;
-    if multi {
-        return Some(json_frame_to_proto(jf, 0));
-    }
     if !*opened {
         *opened = true;
-        let sub = json_open_to_subscribe(jf, method_url.to_string(), 1);
+        let sub = json_open_to_subscribe(jf, method_url.to_string());
         Some(Frame { kind: Some(Kind::Subscribe(sub)) })
     } else {
-        Some(json_frame_to_proto(jf, 1))
+        Some(json_frame_to_proto(jf))
     }
 }
 
-/// Encode an outbound internal `Frame` as a WebSocket message in the stream's codec.
-pub fn to_tung(frame: &Frame, json: bool, multi: bool) -> TungMessage {
+/// Encode an outbound internal `Frame` as a WebSocket message in the connection codec.
+pub fn to_tung(frame: &Frame, json: bool) -> TungMessage {
     if json {
-        if let Some(jf) = proto_frame_to_json(frame, multi) {
+        if let Some(jf) = proto_frame_to_json(frame) {
             return TungMessage::Text(encode_json_frame(&jf).into());
         }
     }

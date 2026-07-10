@@ -43,20 +43,24 @@ harness (and conformance runner) parse that line.
 
 ## Architecture
 
-**Today.** One port; `content-type` disambiguates. Unary → Fetch, with the trailer
-buffered into the body as `[u32 len | message][u32 len | trailer]` (browsers can't read
-HTTP trailers). Streaming → a custom protobuf `Frame` protocol over WebSocket
-(Subscribe / Message / HalfClose / Trailer / Reset / Header). Both `+proto` and `+json`
-codecs. The in-process server (wrap a tonic `Routes`) and the standalone proxy (front any
-gRPC upstream) share one code path via a two-variant `Backend` enum
-(`InProcess(Routes)` | `Upstream(Channel)`).
+One port; `content-type` and the WebSocket subprotocol disambiguate. Transport is a
+per-client config `{ codec, unary, streaming }` (Phases 1–3 of the h2ts pivot are done —
+see [doc/H2TS_INTEGRATION.md](doc/H2TS_INTEGRATION.md)):
 
-**Planned — the h2ts pivot** (see [doc/H2TS_INTEGRATION.md](doc/H2TS_INTEGRATION.md),
-gated on the h2ts npm publish). The **binary** path moves to *real* gRPC over
-[h2ts](https://github.com/debdattabasu/h2ts) (real HTTP/2 tunneled over a WebSocket) —
-server becomes unmodified tonic behind an h2ts gateway. The **JSON** path stays the
-current custom `Frame` protocol (Fetch unary + one WS per stream, plaintext, no h2ts) for
-browser debuggability. `stream_id` comes out of the proto (every channel is single-stream).
+- **Binary (default) → real gRPC over h2ts.** The browser speaks real HTTP/2 (trailers,
+  multiplexing) tunneled over a WebSocket by [h2ts](https://github.com/debdattabasu/h2ts);
+  the server is unmodified tonic behind an h2ts gateway — `serve_h2` in-process, or a
+  byte-transparent `bridge` in the proxy. No translation on this path (`src/h2ts.rs`,
+  client `h2ts-transport.ts`).
+- **JSON (and binary `streaming: "ws"`) → the custom `Frame` protocol, single-stream.**
+  Unary → Fetch, trailer buffered into the body as `[u32 len | message][u32 len | trailer]`
+  (browsers can't read HTTP trailers). Streaming → **one WebSocket per stream** carrying
+  `Frame`s (Subscribe / Message / HalfClose / Trailer / Reset / Header); the WS URL is the
+  method. Plaintext JSON for browser debuggability. No multiplexing — no `stream_id`.
+
+The in-process server (wrap a tonic `Routes`) and the standalone proxy (front any gRPC
+upstream) share one code path via a two-variant `Backend` enum
+(`InProcess(Routes)` | `Upstream(Channel)`).
 
 ## Conventions & gotchas
 

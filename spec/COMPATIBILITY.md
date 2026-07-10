@@ -55,25 +55,22 @@ This is **not** HTTP/2-style framing. The rules are deliberately minimal:
   interleaving, no per-stream credit windows. Backpressure is TCP + `bufferedAmount`.
   Keeping messages atomic is also what keeps the browser DevTools Network → Messages
   panel readable.
-- **No negotiation.** If a feature (e.g. multiplexing) is disabled server-side and a
-  client sends a `subscribe` for a new stream on an existing WebSocket, the server simply
-  replies with an error frame for that stream. Nothing is negotiated in the handshake.
-- **Purpose is the HTTP/1 connection cap, not performance.** Over HTTP/2 the transport
-  multiplexes WebSockets for free (RFC 8441 extended CONNECT), so app-level multiplexing
-  earns its keep only where a browser is limited to ~6 connections/host. All three major
-  browsers now support WS-over-h2, but Safari does so **only when it can reuse an already
-  open h2 connection**; if it must open a fresh connection for the WebSocket it falls back
-  to HTTP/1.1 — and those h1.1 WebSockets are subject to the ~6-connection cap, where
-  multiplexing helps.
+- **No negotiation.** If a server has a feature disabled and the client opens a stream
+  that needs it, the server replies with a `Reset`. Nothing is negotiated in the handshake.
+- **One WebSocket per stream on this path; multiplexing lives elsewhere.** The custom
+  `Frame` path opens a fresh WebSocket per stream, which under HTTP/1.1 is subject to the
+  browser's ~6-connections/host cap. That cap is exactly why the **binary default runs real
+  HTTP/2 over h2ts** — one WebSocket, many streams, multiplexed natively (see
+  [doc/H2TS_INTEGRATION.md](../doc/H2TS_INTEGRATION.md)). Over HTTP/2 the browser also
+  multiplexes WebSockets for free (RFC 8441 extended CONNECT), though Safari does so only
+  when it can reuse an already-open h2 connection.
 
 ### Consequences to design for
 
 - **Hard max-message-size.** Because a message cannot span frames, an oversized message
   is one giant WS frame — both ends must enforce a configurable size limit (same knob as
   README point 5).
-- **Atomic-message head-of-line blocking.** On a multiplexed WebSocket, WS messages are
-  strictly ordered one at a time, so a large message on stream A delays other streams'
-  messages for its transmit duration. It is *bounded* by max-message-size (not an
-  indefinite stall), which is the reason to keep that cap tight when multiplexing.
-- **Reserve `stream_id` in the envelope from day one** so single-WS-per-stream and the
-  multiplexed pool share one wire format.
+- **No cross-stream head-of-line blocking on this path.** Each stream has its own
+  WebSocket, so a large message on one stream never delays another. (Within a stream, a
+  large atomic message still occupies the socket for its transmit duration — bounded by
+  max-message-size.)

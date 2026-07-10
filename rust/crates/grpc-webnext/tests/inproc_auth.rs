@@ -35,7 +35,7 @@ async fn connect(url: &str, subprotocol: Option<&str>) -> (Ws, Resp) {
     tokio_tungstenite::connect_async(req).await.unwrap()
 }
 
-fn subscribe(stream_id: u32, metadata: &[(&str, &str)]) -> TungMessage {
+fn subscribe(metadata: &[(&str, &str)]) -> TungMessage {
     let headers = metadata
         .iter()
         .map(|(k, v)| grpc_webnext::pb::Metadatum {
@@ -45,7 +45,6 @@ fn subscribe(stream_id: u32, metadata: &[(&str, &str)]) -> TungMessage {
         .collect();
     TungMessage::Binary(encode_frame(&Frame {
         kind: Some(Kind::Subscribe(Subscribe {
-            stream_id,
             method: "/echo.v1.Echo/Unary".into(),
             headers,
             timeout_millis: 0,
@@ -55,9 +54,9 @@ fn subscribe(stream_id: u32, metadata: &[(&str, &str)]) -> TungMessage {
     }))
 }
 
-fn half_close(stream_id: u32) -> TungMessage {
+fn half_close() -> TungMessage {
     TungMessage::Binary(encode_frame(&Frame {
-        kind: Some(Kind::HalfClose(grpc_webnext::pb::HalfClose { stream_id })),
+        kind: Some(Kind::HalfClose(grpc_webnext::pb::HalfClose {})),
     }))
 }
 
@@ -106,34 +105,8 @@ async fn no_credential_opens_the_connection() {
     // configured; the stream self-authenticates per call.
     let url = start(bearer_good_gate()).await;
     let (mut ws, _) = connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
-    ws.send(subscribe(1, &[])).await.unwrap();
-    ws.send(half_close(1)).await.unwrap();
-    let (code, _) = read_until_status(&mut ws).await.expect("expected a status");
-    assert_eq!(code, 0);
-}
-
-#[tokio::test]
-async fn multiplex_auth_without_method_query_is_rejected() {
-    // A multiplexed socket carrying a credential must pass ?method= — else there is
-    // nothing to authenticate it against, so it's a hard reject.
-    let url = start(bearer_good_gate()).await;
-    let (mut ws, _) = connect(&url, Some("grpc-webnext+proto+multi, bearer.good")).await;
-    let cf = read_close(&mut ws).await;
-    assert_eq!(u16::from(cf.code), 4000 + Code::FailedPrecondition as u16);
-}
-
-#[tokio::test]
-async fn multiplex_auth_with_method_query_admits() {
-    // With ?method=, the credential is authenticated against that method and the
-    // connection opens.
-    let url = start(bearer_good_gate()).await;
-    let (mut ws, _) = connect(
-        &format!("{url}/?method=/echo.v1.Echo/Unary"),
-        Some("grpc-webnext+proto+multi, bearer.good"),
-    )
-    .await;
-    ws.send(subscribe(1, &[])).await.unwrap();
-    ws.send(half_close(1)).await.unwrap();
+    ws.send(subscribe(&[])).await.unwrap();
+    ws.send(half_close()).await.unwrap();
     let (code, _) = read_until_status(&mut ws).await.expect("expected a status");
     assert_eq!(code, 0);
 }
@@ -153,47 +126,10 @@ async fn connect_gate_admits_valid_token_and_echoes_subprotocol() {
     );
 
     // The stream works: unary echo round-trips (half-close ends the request).
-    ws.send(subscribe(1, &[])).await.unwrap();
-    ws.send(half_close(1)).await.unwrap();
+    ws.send(subscribe(&[])).await.unwrap();
+    ws.send(half_close()).await.unwrap();
     let (code, _) = read_until_status(&mut ws).await.expect("expected a status");
     assert_eq!(code, 0);
-}
-
-#[tokio::test]
-async fn multiplex_auth_validates_bearer_against_query_method() {
-    // The credential is authenticated *against the ?method= value*: a gate that only
-    // admits one method rejects a connection whose query names a different one.
-    let config = ServerConfig {
-        connect_auth: Some(Arc::new(|method: &str, headers: &http::HeaderMap| {
-            if method == "/echo.v1.Echo/Unary" && ws_bearer_token(headers).as_deref() == Some("good") {
-                Ok(())
-            } else {
-                Err(Status::unauthenticated("denied"))
-            }
-        })),
-        allow_implicit_codec: true,
-        ..Default::default()
-    };
-    let url = start(config).await;
-
-    // Query names the admitted method -> connection opens and the stream runs.
-    let (mut ws, _) = connect(
-        &format!("{url}/?method=/echo.v1.Echo/Unary"),
-        Some("grpc-webnext+proto+multi, bearer.good"),
-    )
-    .await;
-    ws.send(subscribe(1, &[])).await.unwrap();
-    ws.send(half_close(1)).await.unwrap();
-    assert_eq!(read_until_status(&mut ws).await.expect("status").0, 0);
-
-    // Query names a different method -> rejected (proves the query method reaches the gate).
-    let (mut ws2, _) = connect(
-        &format!("{url}/?method=/echo.v1.Echo/Other"),
-        Some("grpc-webnext+proto+multi, bearer.good"),
-    )
-    .await;
-    let cf = read_close(&mut ws2).await;
-    assert_eq!(u16::from(cf.code), 4000 + Code::Unauthenticated as u16);
 }
 
 #[tokio::test]
@@ -212,40 +148,11 @@ async fn single_stream_stream_auth_rejects_with_reset() {
     let url = start(config).await;
     // No bearer (so connect_auth doesn't apply); the open frame carries no auth metadata.
     let (mut ws, _) = connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
-    ws.send(subscribe(1, &[])).await.unwrap();
-    ws.send(half_close(1)).await.unwrap();
+    ws.send(subscribe(&[])).await.unwrap();
+    ws.send(half_close()).await.unwrap();
     let (code, msg) = read_until_status(&mut ws).await.expect("status");
     assert_eq!(code, Code::Unauthenticated as u32);
     assert_eq!(msg, "stream denied");
-}
-
-#[tokio::test]
-async fn stream_auth_rejects_with_reset() {
-    let config = ServerConfig {
-        stream_auth: Some(Arc::new(|_method: &str, md: &tonic::metadata::MetadataMap| {
-            match md.get("authorization").and_then(|v| v.to_str().ok()) {
-                Some("Bearer good") => Ok(()),
-                _ => Err(Status::unauthenticated("stream denied")),
-            }
-        })),
-        allow_implicit_codec: true,
-        ..Default::default()
-    };
-    let url = start(config).await;
-    // Two streams on one socket -> multiplexed (frames carry method + streamId).
-    let (mut ws, _) = connect(&url, Some("grpc-webnext+proto+multi")).await;
-
-    // No metadata -> Reset UNAUTHENTICATED for that stream.
-    ws.send(subscribe(1, &[])).await.unwrap();
-    let (code, msg) = read_until_status(&mut ws).await.expect("expected a status");
-    assert_eq!(code, Code::Unauthenticated as u32);
-    assert_eq!(msg, "stream denied");
-
-    // Correct metadata -> the call proceeds and echoes OK (status 0).
-    ws.send(subscribe(2, &[("authorization", "Bearer good")])).await.unwrap();
-    ws.send(half_close(2)).await.unwrap();
-    let (code, _) = read_until_status(&mut ws).await.expect("expected a status");
-    assert_eq!(code, 0);
 }
 
 // ---- Fetch-path per-stream auth: the same `stream_auth` hook guards unary Fetch ----

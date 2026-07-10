@@ -61,7 +61,6 @@ async fn streaming_deadline_trailer_and_upstream_cancel() {
 
     let mut ws = connect_proto(&url).await;
     ws.send(frame(Kind::Subscribe(Subscribe {
-        stream_id: 1,
         method: "/echo.v1.Echo/Hang".into(),
         headers: vec![],
         timeout_millis: 200,
@@ -70,7 +69,7 @@ async fn streaming_deadline_trailer_and_upstream_cancel() {
     })))
     .await
     .unwrap();
-    ws.send(frame(Kind::HalfClose(HalfClose { stream_id: 1 })))
+    ws.send(frame(Kind::HalfClose(HalfClose {})))
         .await
         .unwrap();
 

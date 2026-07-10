@@ -19,7 +19,7 @@ export const protobufPackage = "grpc.webnext.v1";
  * are never reused.
  */
 export interface Frame {
-  /** open a stream (client -> server) */
+  /** open the stream (client -> server) */
   subscribe?:
     | Subscribe
     | undefined;
@@ -35,7 +35,7 @@ export interface Frame {
   trailer?:
     | Trailer
     | undefined;
-  /** abort a single stream, either direction */
+  /** abort the stream, either direction */
   reset?:
     | Reset
     | undefined;
@@ -50,10 +50,8 @@ export interface Metadatum {
   binValue?: Uint8Array | undefined;
 }
 
-/** Open a new logical stream on this WebSocket. First frame of every call. */
+/** Open the stream. The first frame of the connection. */
 export interface Subscribe {
-  /** unique per WebSocket, client-allocated */
-  streamId: number;
   /** e.g. "/pkg.Service/Method" */
   method: string;
   /** request metadata */
@@ -68,35 +66,28 @@ export interface Subscribe {
 
 /** Initial response metadata, sent once before the first Message (if any). */
 export interface Header {
-  streamId: number;
   headers: Metadatum[];
 }
 
 export interface Message {
-  streamId: number;
   /** a single encoded gRPC message */
   payload: Uint8Array;
 }
 
+/** Client is done sending (a bare marker). */
 export interface HalfClose {
-  streamId: number;
 }
 
 /** Stream completed. Carries gRPC status and trailing metadata. */
 export interface Trailer {
-  streamId: number;
   /** gRPC status code (0 = OK) */
   statusCode: number;
   statusMessage: string;
   trailers: Metadatum[];
 }
 
-/**
- * Abort one stream without affecting the rest of the WebSocket. Also used by
- * the server to reject a stream (e.g. feature disabled) — no prior negotiation.
- */
+/** Abort the stream. Also used by the server to reject it (e.g. feature disabled). */
 export interface Reset {
-  streamId: number;
   /** gRPC status code (e.g. CANCELLED, UNIMPLEMENTED) */
   statusCode: number;
   statusMessage: string;
@@ -364,28 +355,25 @@ export const Metadatum: MessageFns<Metadatum> = {
 };
 
 function createBaseSubscribe(): Subscribe {
-  return { streamId: 0, method: "", headers: [], timeoutMillis: 0, initialPayload: new Uint8Array(0), json: false };
+  return { method: "", headers: [], timeoutMillis: 0, initialPayload: new Uint8Array(0), json: false };
 }
 
 export const Subscribe: MessageFns<Subscribe> = {
   encode(message: Subscribe, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.streamId !== 0) {
-      writer.uint32(8).uint32(message.streamId);
-    }
     if (message.method !== "") {
-      writer.uint32(18).string(message.method);
+      writer.uint32(10).string(message.method);
     }
     for (const v of message.headers) {
-      Metadatum.encode(v!, writer.uint32(26).fork()).join();
+      Metadatum.encode(v!, writer.uint32(18).fork()).join();
     }
     if (message.timeoutMillis !== 0) {
-      writer.uint32(32).uint32(message.timeoutMillis);
+      writer.uint32(24).uint32(message.timeoutMillis);
     }
     if (message.initialPayload.length !== 0) {
-      writer.uint32(42).bytes(message.initialPayload);
+      writer.uint32(34).bytes(message.initialPayload);
     }
     if (message.json !== false) {
-      writer.uint32(48).bool(message.json);
+      writer.uint32(40).bool(message.json);
     }
     return writer;
   },
@@ -398,11 +386,11 @@ export const Subscribe: MessageFns<Subscribe> = {
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1: {
-          if (tag !== 8) {
+          if (tag !== 10) {
             break;
           }
 
-          message.streamId = reader.uint32();
+          message.method = reader.string();
           continue;
         }
         case 2: {
@@ -410,35 +398,27 @@ export const Subscribe: MessageFns<Subscribe> = {
             break;
           }
 
-          message.method = reader.string();
-          continue;
-        }
-        case 3: {
-          if (tag !== 26) {
-            break;
-          }
-
           message.headers.push(Metadatum.decode(reader, reader.uint32()));
           continue;
         }
-        case 4: {
-          if (tag !== 32) {
+        case 3: {
+          if (tag !== 24) {
             break;
           }
 
           message.timeoutMillis = reader.uint32();
           continue;
         }
-        case 5: {
-          if (tag !== 42) {
+        case 4: {
+          if (tag !== 34) {
             break;
           }
 
           message.initialPayload = reader.bytes();
           continue;
         }
-        case 6: {
-          if (tag !== 48) {
+        case 5: {
+          if (tag !== 40) {
             break;
           }
 
@@ -456,11 +436,6 @@ export const Subscribe: MessageFns<Subscribe> = {
 
   fromJSON(object: any): Subscribe {
     return {
-      streamId: isSet(object.streamId)
-        ? globalThis.Number(object.streamId)
-        : isSet(object.stream_id)
-        ? globalThis.Number(object.stream_id)
-        : 0,
       method: isSet(object.method) ? globalThis.String(object.method) : "",
       headers: globalThis.Array.isArray(object?.headers) ? object.headers.map((e: any) => Metadatum.fromJSON(e)) : [],
       timeoutMillis: isSet(object.timeoutMillis)
@@ -479,9 +454,6 @@ export const Subscribe: MessageFns<Subscribe> = {
 
   toJSON(message: Subscribe): unknown {
     const obj: any = {};
-    if (message.streamId !== 0) {
-      obj.streamId = Math.round(message.streamId);
-    }
     if (message.method !== "") {
       obj.method = message.method;
     }
@@ -505,7 +477,6 @@ export const Subscribe: MessageFns<Subscribe> = {
   },
   fromPartial(object: DeepPartial<Subscribe>): Subscribe {
     const message = createBaseSubscribe();
-    message.streamId = object.streamId ?? 0;
     message.method = object.method ?? "";
     message.headers = object.headers?.map((e) => Metadatum.fromPartial(e)) || [];
     message.timeoutMillis = object.timeoutMillis ?? 0;
@@ -516,16 +487,13 @@ export const Subscribe: MessageFns<Subscribe> = {
 };
 
 function createBaseHeader(): Header {
-  return { streamId: 0, headers: [] };
+  return { headers: [] };
 }
 
 export const Header: MessageFns<Header> = {
   encode(message: Header, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.streamId !== 0) {
-      writer.uint32(8).uint32(message.streamId);
-    }
     for (const v of message.headers) {
-      Metadatum.encode(v!, writer.uint32(18).fork()).join();
+      Metadatum.encode(v!, writer.uint32(10).fork()).join();
     }
     return writer;
   },
@@ -538,15 +506,7 @@ export const Header: MessageFns<Header> = {
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1: {
-          if (tag !== 8) {
-            break;
-          }
-
-          message.streamId = reader.uint32();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
+          if (tag !== 10) {
             break;
           }
 
@@ -564,20 +524,12 @@ export const Header: MessageFns<Header> = {
 
   fromJSON(object: any): Header {
     return {
-      streamId: isSet(object.streamId)
-        ? globalThis.Number(object.streamId)
-        : isSet(object.stream_id)
-        ? globalThis.Number(object.stream_id)
-        : 0,
       headers: globalThis.Array.isArray(object?.headers) ? object.headers.map((e: any) => Metadatum.fromJSON(e)) : [],
     };
   },
 
   toJSON(message: Header): unknown {
     const obj: any = {};
-    if (message.streamId !== 0) {
-      obj.streamId = Math.round(message.streamId);
-    }
     if (message.headers?.length) {
       obj.headers = message.headers.map((e) => Metadatum.toJSON(e));
     }
@@ -589,23 +541,19 @@ export const Header: MessageFns<Header> = {
   },
   fromPartial(object: DeepPartial<Header>): Header {
     const message = createBaseHeader();
-    message.streamId = object.streamId ?? 0;
     message.headers = object.headers?.map((e) => Metadatum.fromPartial(e)) || [];
     return message;
   },
 };
 
 function createBaseMessage(): Message {
-  return { streamId: 0, payload: new Uint8Array(0) };
+  return { payload: new Uint8Array(0) };
 }
 
 export const Message: MessageFns<Message> = {
   encode(message: Message, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.streamId !== 0) {
-      writer.uint32(8).uint32(message.streamId);
-    }
     if (message.payload.length !== 0) {
-      writer.uint32(18).bytes(message.payload);
+      writer.uint32(10).bytes(message.payload);
     }
     return writer;
   },
@@ -618,15 +566,7 @@ export const Message: MessageFns<Message> = {
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1: {
-          if (tag !== 8) {
-            break;
-          }
-
-          message.streamId = reader.uint32();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
+          if (tag !== 10) {
             break;
           }
 
@@ -643,21 +583,11 @@ export const Message: MessageFns<Message> = {
   },
 
   fromJSON(object: any): Message {
-    return {
-      streamId: isSet(object.streamId)
-        ? globalThis.Number(object.streamId)
-        : isSet(object.stream_id)
-        ? globalThis.Number(object.stream_id)
-        : 0,
-      payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0),
-    };
+    return { payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0) };
   },
 
   toJSON(message: Message): unknown {
     const obj: any = {};
-    if (message.streamId !== 0) {
-      obj.streamId = Math.round(message.streamId);
-    }
     if (message.payload.length !== 0) {
       obj.payload = base64FromBytes(message.payload);
     }
@@ -669,21 +599,17 @@ export const Message: MessageFns<Message> = {
   },
   fromPartial(object: DeepPartial<Message>): Message {
     const message = createBaseMessage();
-    message.streamId = object.streamId ?? 0;
     message.payload = object.payload ?? new Uint8Array(0);
     return message;
   },
 };
 
 function createBaseHalfClose(): HalfClose {
-  return { streamId: 0 };
+  return {};
 }
 
 export const HalfClose: MessageFns<HalfClose> = {
-  encode(message: HalfClose, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.streamId !== 0) {
-      writer.uint32(8).uint32(message.streamId);
-    }
+  encode(_: HalfClose, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     return writer;
   },
 
@@ -694,14 +620,6 @@ export const HalfClose: MessageFns<HalfClose> = {
     while (reader.pos < end) {
       const tag = reader.uint32();
       switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 8) {
-            break;
-          }
-
-          message.streamId = reader.uint32();
-          continue;
-        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -711,51 +629,38 @@ export const HalfClose: MessageFns<HalfClose> = {
     return message;
   },
 
-  fromJSON(object: any): HalfClose {
-    return {
-      streamId: isSet(object.streamId)
-        ? globalThis.Number(object.streamId)
-        : isSet(object.stream_id)
-        ? globalThis.Number(object.stream_id)
-        : 0,
-    };
+  fromJSON(_: any): HalfClose {
+    return {};
   },
 
-  toJSON(message: HalfClose): unknown {
+  toJSON(_: HalfClose): unknown {
     const obj: any = {};
-    if (message.streamId !== 0) {
-      obj.streamId = Math.round(message.streamId);
-    }
     return obj;
   },
 
   create(base?: DeepPartial<HalfClose>): HalfClose {
     return HalfClose.fromPartial(base ?? {});
   },
-  fromPartial(object: DeepPartial<HalfClose>): HalfClose {
+  fromPartial(_: DeepPartial<HalfClose>): HalfClose {
     const message = createBaseHalfClose();
-    message.streamId = object.streamId ?? 0;
     return message;
   },
 };
 
 function createBaseTrailer(): Trailer {
-  return { streamId: 0, statusCode: 0, statusMessage: "", trailers: [] };
+  return { statusCode: 0, statusMessage: "", trailers: [] };
 }
 
 export const Trailer: MessageFns<Trailer> = {
   encode(message: Trailer, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.streamId !== 0) {
-      writer.uint32(8).uint32(message.streamId);
-    }
     if (message.statusCode !== 0) {
-      writer.uint32(16).uint32(message.statusCode);
+      writer.uint32(8).uint32(message.statusCode);
     }
     if (message.statusMessage !== "") {
-      writer.uint32(26).string(message.statusMessage);
+      writer.uint32(18).string(message.statusMessage);
     }
     for (const v of message.trailers) {
-      Metadatum.encode(v!, writer.uint32(34).fork()).join();
+      Metadatum.encode(v!, writer.uint32(26).fork()).join();
     }
     return writer;
   },
@@ -772,27 +677,19 @@ export const Trailer: MessageFns<Trailer> = {
             break;
           }
 
-          message.streamId = reader.uint32();
-          continue;
-        }
-        case 2: {
-          if (tag !== 16) {
-            break;
-          }
-
           message.statusCode = reader.uint32();
           continue;
         }
-        case 3: {
-          if (tag !== 26) {
+        case 2: {
+          if (tag !== 18) {
             break;
           }
 
           message.statusMessage = reader.string();
           continue;
         }
-        case 4: {
-          if (tag !== 34) {
+        case 3: {
+          if (tag !== 26) {
             break;
           }
 
@@ -810,11 +707,6 @@ export const Trailer: MessageFns<Trailer> = {
 
   fromJSON(object: any): Trailer {
     return {
-      streamId: isSet(object.streamId)
-        ? globalThis.Number(object.streamId)
-        : isSet(object.stream_id)
-        ? globalThis.Number(object.stream_id)
-        : 0,
       statusCode: isSet(object.statusCode)
         ? globalThis.Number(object.statusCode)
         : isSet(object.status_code)
@@ -833,9 +725,6 @@ export const Trailer: MessageFns<Trailer> = {
 
   toJSON(message: Trailer): unknown {
     const obj: any = {};
-    if (message.streamId !== 0) {
-      obj.streamId = Math.round(message.streamId);
-    }
     if (message.statusCode !== 0) {
       obj.statusCode = Math.round(message.statusCode);
     }
@@ -853,7 +742,6 @@ export const Trailer: MessageFns<Trailer> = {
   },
   fromPartial(object: DeepPartial<Trailer>): Trailer {
     const message = createBaseTrailer();
-    message.streamId = object.streamId ?? 0;
     message.statusCode = object.statusCode ?? 0;
     message.statusMessage = object.statusMessage ?? "";
     message.trailers = object.trailers?.map((e) => Metadatum.fromPartial(e)) || [];
@@ -862,19 +750,16 @@ export const Trailer: MessageFns<Trailer> = {
 };
 
 function createBaseReset(): Reset {
-  return { streamId: 0, statusCode: 0, statusMessage: "" };
+  return { statusCode: 0, statusMessage: "" };
 }
 
 export const Reset: MessageFns<Reset> = {
   encode(message: Reset, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.streamId !== 0) {
-      writer.uint32(8).uint32(message.streamId);
-    }
     if (message.statusCode !== 0) {
-      writer.uint32(16).uint32(message.statusCode);
+      writer.uint32(8).uint32(message.statusCode);
     }
     if (message.statusMessage !== "") {
-      writer.uint32(26).string(message.statusMessage);
+      writer.uint32(18).string(message.statusMessage);
     }
     return writer;
   },
@@ -891,19 +776,11 @@ export const Reset: MessageFns<Reset> = {
             break;
           }
 
-          message.streamId = reader.uint32();
-          continue;
-        }
-        case 2: {
-          if (tag !== 16) {
-            break;
-          }
-
           message.statusCode = reader.uint32();
           continue;
         }
-        case 3: {
-          if (tag !== 26) {
+        case 2: {
+          if (tag !== 18) {
             break;
           }
 
@@ -921,11 +798,6 @@ export const Reset: MessageFns<Reset> = {
 
   fromJSON(object: any): Reset {
     return {
-      streamId: isSet(object.streamId)
-        ? globalThis.Number(object.streamId)
-        : isSet(object.stream_id)
-        ? globalThis.Number(object.stream_id)
-        : 0,
       statusCode: isSet(object.statusCode)
         ? globalThis.Number(object.statusCode)
         : isSet(object.status_code)
@@ -941,9 +813,6 @@ export const Reset: MessageFns<Reset> = {
 
   toJSON(message: Reset): unknown {
     const obj: any = {};
-    if (message.streamId !== 0) {
-      obj.streamId = Math.round(message.streamId);
-    }
     if (message.statusCode !== 0) {
       obj.statusCode = Math.round(message.statusCode);
     }
@@ -958,7 +827,6 @@ export const Reset: MessageFns<Reset> = {
   },
   fromPartial(object: DeepPartial<Reset>): Reset {
     const message = createBaseReset();
-    message.streamId = object.streamId ?? 0;
     message.statusCode = object.statusCode ?? 0;
     message.statusMessage = object.statusMessage ?? "";
     return message;
