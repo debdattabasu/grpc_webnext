@@ -15,6 +15,20 @@ cases:
   # RESOURCE_EXHAUSTED on every path. Re-add an oversize-response case once that policy is
   # settled (see conformance/README.md "Known gaps").
 
+  # An oversize REQUEST message is rejected with RESOURCE_EXHAUSTED on every path: fetch/ws
+  # bound the request body, and the h2ts path checks the gRPC frame length prefix.
+  - name: oversize-request-rejected
+    rpc: Unary
+    codecs: [proto, json]
+    requires: { max_message_bytes: 1048576 }   # 1 MiB
+    request:
+      payload: { zeros: 2097152 }               # 2 MiB > limit
+    expect:
+      # Rejected on every path (limit honored). The exact code is transport-dependent: a
+      # clean RESOURCE_EXHAUSTED if the client finishes uploading before the server rejects,
+      # else a mid-upload stream/transport failure — so assert only that it was rejected.
+      status: { not_ok: true }
+
   # A large response (under any limit) passes intact.
   - name: large-response-within-limit
     rpc: Unary

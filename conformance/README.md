@@ -91,17 +91,20 @@ grammar. Current coverage:
 | unary | [cases/unary.yaml](cases/unary.yaml) | OK, empty payload, non-OK status + trailing metadata, response headers |
 | streaming | [cases/streaming.yaml](cases/streaming.yaml) | server-stream (incl. messages-then-error), client-stream aggregate, bidi echo, client cancel → CANCELLED |
 | deadline | [cases/deadline.yaml](cases/deadline.yaml) | unary + stream `grpc-timeout` expiry (DEADLINE_EXCEEDED); within-deadline passes |
-| limits | [cases/limits.yaml](cases/limits.yaml) | large response intact, `+json` w/o transcoder → UNIMPLEMENTED, ASCII+`-bin` metadata round-trip |
+| limits | [cases/limits.yaml](cases/limits.yaml) | oversize request rejected on every path, large response intact, `+json` w/o transcoder → UNIMPLEMENTED, ASCII+`-bin` metadata round-trip |
 
 Each case runs under every applicable **transport profile**: `proto/h2ts` (real gRPC over
 the h2ts tunnel), `proto/ws` (the custom `Frame` path, unary over Fetch), and `json` (the
-custom path, Fetch + WS). 42 case×profile runs, all green.
+custom path, Fetch + WS). 45 case×profile runs, all green.
 
 **Known gaps** (surfaced by the run — tracked, not silently passed):
-- **Response-size enforcement.** `max_message_bytes` bounds inbound *request* messages on
-  the custom `Frame` path; the h2ts binary path uses real gRPC's own limits. So an oversize
-  *response* isn't uniformly rejected with RESOURCE_EXHAUSTED — re-add an oversize-response
-  case once that policy is settled.
+- **Response-size enforcement.** `max_message_bytes` now bounds inbound *request* messages on
+  every path (fetch/ws bound the request body; the h2ts path checks the gRPC frame length
+  prefix). But an oversize *response* isn't rejected — the custom paths don't check outbound
+  message size and the h2ts path leaves it to tonic's own encode limit. Also, a *mid-upload*
+  request rejection surfaces as a stream/transport failure rather than a clean
+  RESOURCE_EXHAUSTED on the Fetch/h2ts paths (inherent HTTP/2 semantics), so the case asserts
+  only that it was rejected. Settle the response-size policy, then extend.
 
 The first run also **found two real bugs, now fixed**: trailing metadata on a trailers-only
 (error) response was dropped on the h2ts client and the Fetch server path (both read

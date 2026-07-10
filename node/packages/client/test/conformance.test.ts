@@ -30,7 +30,7 @@ const casesDir = path.join(repoRoot, "conformance", "cases");
 const wsImpl = WebSocket as unknown as typeof globalThis.WebSocket;
 
 // --- case types (the YAML shape; see conformance/schema/case.schema.json) ---------------
-type Bytes = { text?: string; b64?: string };
+type Bytes = { text?: string; b64?: string; zeros?: number };
 type Meta = { key: string; ascii?: string; b64?: string };
 type RD = {
   status_code?: number;
@@ -58,7 +58,7 @@ type Case = {
   requests?: Msg[];
   cancel_after_messages?: number;
   expect: {
-    status: { code: number; message_contains?: string };
+    status: { code?: number; message_contains?: string; not_ok?: boolean };
     response?: Matcher;
     messages?: Matcher[];
     message_count?: number;
@@ -72,9 +72,11 @@ type Suite = { suite: string; cases: Case[] };
 const toBytes = (b?: Bytes): Uint8Array =>
   !b
     ? new Uint8Array()
-    : b.text !== undefined
-      ? new TextEncoder().encode(b.text)
-      : new Uint8Array(Buffer.from(b.b64 ?? "", "base64"));
+    : b.zeros !== undefined
+      ? new Uint8Array(b.zeros)
+      : b.text !== undefined
+        ? new TextEncoder().encode(b.text)
+        : new Uint8Array(Buffer.from(b.b64 ?? "", "base64"));
 
 const metaValue = (m: Meta): string | Uint8Array =>
   m.b64 !== undefined ? new Uint8Array(Buffer.from(m.b64, "base64")) : (m.ascii ?? "");
@@ -278,7 +280,13 @@ function assertPayload(matcher: Matcher, cp: ConformancePayload | undefined) {
 }
 
 function assertCase(c: Case, r: Result) {
-  expect(r.status.code, `status (details: "${r.status.details}")`).toBe(c.expect.status.code);
+  if (c.expect.status.not_ok) {
+    // The exact code is transport-dependent (a mid-upload rejection may surface as a stream
+    // failure rather than a clean RESOURCE_EXHAUSTED) — assert only that it was rejected.
+    expect(r.status.code, `expected non-OK (details: "${r.status.details}")`).not.toBe(Status.OK);
+  } else {
+    expect(r.status.code, `status (details: "${r.status.details}")`).toBe(c.expect.status.code);
+  }
   if (c.expect.status.message_contains) expect(r.status.details).toContain(c.expect.status.message_contains);
   if (c.expect.response) assertPayload(c.expect.response, r.response);
   if (c.expect.messages) {

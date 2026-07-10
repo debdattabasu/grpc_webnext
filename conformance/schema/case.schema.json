@@ -12,11 +12,12 @@
   },
   "$defs": {
     "bytes": {
-      "description": "A byte value, given as UTF-8 text or base64.",
+      "description": "A byte value: UTF-8 text, base64, or N zero bytes (for size-limit cases).",
       "type": "object",
       "oneOf": [
         { "required": ["text"], "additionalProperties": false, "properties": { "text": { "type": "string" } } },
-        { "required": ["b64"], "additionalProperties": false, "properties": { "b64": { "type": "string" } } }
+        { "required": ["b64"], "additionalProperties": false, "properties": { "b64": { "type": "string" } } },
+        { "required": ["zeros"], "additionalProperties": false, "properties": { "zeros": { "type": "integer", "minimum": 0 } } }
       ]
     },
     "metadatum": {
@@ -108,9 +109,12 @@
           "properties": {
             "status": {
               "type": "object",
-              "required": ["code"],
               "additionalProperties": false,
-              "properties": { "code": { "type": "integer" }, "message_contains": { "type": "string" } }
+              "properties": {
+                "code": { "type": "integer" },
+                "message_contains": { "type": "string" },
+                "not_ok": { "type": "boolean", "description": "Assert any non-OK status (rejection), when the exact code is transport-dependent." }
+              }
             },
             "response": { "$ref": "#/$defs/payloadMatcher" },
             "messages": { "type": "array", "items": { "$ref": "#/$defs/payloadMatcher" } },

@@ -14,13 +14,16 @@
 //! and Fetch/custom-`Frame` paths are untouched and live elsewhere.
 
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::{BodyExt, Empty};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame as HttpBodyFrame, Incoming, SizeHint};
 use tokio::net::TcpStream;
 use tonic::body::Body as TonicBody;
+use tonic::Status;
 use tower::ServiceExt as _;
 
 use crate::{Backend, BoxError, ResBody, Runtime};
@@ -44,12 +47,18 @@ pub(crate) fn serve(rt: &Runtime, req: &mut Request<Incoming>) -> Response<ResBo
             }
         };
         match &rt.backend {
-            // Real gRPC, served directly by the in-process router — no translation.
+            // Real gRPC, served directly by the in-process router — no translation. The
+            // request body is wrapped so an oversized gRPC message is rejected with
+            // RESOURCE_EXHAUSTED, honoring `max_message_bytes` like the custom paths do.
             Backend::InProcess(routes) => {
                 let routes = routes.clone();
+                let max = rt.cfg.max_message_bytes;
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let routes = routes.clone();
-                    async move { routes.oneshot(req.map(TonicBody::new)).await }
+                    async move {
+                        let req = req.map(|body| TonicBody::new(GrpcSizeLimit::new(body, max)));
+                        routes.oneshot(req).await
+                    }
                 });
                 if let Err(e) = h2ts_server::serve_h2(ws, service).await {
                     tracing::debug!("h2ts serve_h2 ended: {e}");
@@ -77,4 +86,93 @@ pub(crate) fn serve(rt: &Runtime, req: &mut Request<Incoming>) -> Response<ResBo
 /// The `101` (and any rejection) response body is `Empty`; box it into the crate's `ResBody`.
 fn box_empty(body: Empty<Bytes>) -> ResBody {
     body.map_err(|e: Infallible| -> BoxError { match e {} }).boxed_unsync()
+}
+
+/// A request body that passes bytes through unchanged but fails the stream with
+/// `RESOURCE_EXHAUSTED` if any length-prefixed gRPC message declares a size over `max` —
+/// giving the real-gRPC h2ts path the same `max_message_bytes` request limit the custom
+/// Fetch/WebSocket paths enforce. tonic surfaces the boxed `Status` to the client verbatim.
+struct GrpcSizeLimit<B> {
+    inner: B,
+    max: usize,
+    // gRPC frame parse state: a 5-byte prefix (1 compression flag + u32 big-endian length),
+    // then that many message bytes.
+    header_seen: usize,
+    len_buf: [u8; 4],
+    body_remaining: usize,
+}
+
+impl<B> GrpcSizeLimit<B> {
+    fn new(inner: B, max: usize) -> Self {
+        Self { inner, max, header_seen: 0, len_buf: [0; 4], body_remaining: 0 }
+    }
+
+    /// Walk `data`, tracking frame boundaries; error if a declared message length exceeds `max`.
+    fn inspect(&mut self, data: &[u8]) -> Result<(), BoxError> {
+        let mut i = 0;
+        while i < data.len() {
+            if self.header_seen < 5 {
+                if self.header_seen >= 1 {
+                    self.len_buf[self.header_seen - 1] = data[i];
+                }
+                self.header_seen += 1;
+                i += 1;
+                if self.header_seen == 5 {
+                    let len = u32::from_be_bytes(self.len_buf) as usize;
+                    if len > self.max {
+                        return Err(Box::new(Status::resource_exhausted(format!(
+                            "request message exceeds size limit ({} bytes)",
+                            self.max
+                        ))) as BoxError);
+                    }
+                    self.body_remaining = len;
+                }
+            } else {
+                let take = self.body_remaining.min(data.len() - i);
+                self.body_remaining -= take;
+                i += take;
+                if self.body_remaining == 0 {
+                    self.header_seen = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<B> Body for GrpcSizeLimit<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<HttpBodyFrame<Bytes>, BoxError>>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if let Err(e) = this.inspect(data) {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
