@@ -112,6 +112,14 @@ async fn passthrough(rt: &Runtime, req: Request<Incoming>) -> Response<ResBody> 
 /// gate, then upgrade and hand off to `ws::serve`.
 async fn handle_ws_upgrade(rt: &Runtime, mut req: Request<Incoming>) -> Response<ResBody> {
     let offered = ws_subprotocols(req.headers());
+
+    // Binary path over real HTTP/2: the client offered the `h2ts` subprotocol, so it speaks
+    // real gRPC over the tunnel — not the custom Frame protocol. Serve it directly (tonic
+    // in-process) or byte-pump it to the upstream (proxy); no codec negotiation applies.
+    if offered.iter().any(|p| p == h2ts_server::DEFAULT_SUBPROTOCOL) {
+        return crate::h2ts::serve(rt, &mut req);
+    }
+
     let has = |s: &str| offered.iter().any(|p| p == s);
     // `explicit` = a grpc-webnext codec subprotocol was offered (main-endpoint OK).
     let (codec, multi, explicit) = if has(WS_SUBPROTOCOL_PROTO_MULTI) {

@@ -27,6 +27,7 @@ use tonic::Status;
 // Inbound protocol translation.
 pub mod backend;
 mod fetch;
+mod h2ts;
 mod reflect;
 pub mod schema;
 mod ws;
@@ -181,6 +182,8 @@ pub(crate) struct RunConfig {
     pub connect_auth: Option<ConnectAuthFn>,
     pub stream_auth: Option<StreamAuthFn>,
     pub admin_reload_path: Option<String>,
+    /// Upstream `host:port` for the h2ts byte-pump path (proxy only; `None` in-process).
+    pub upstream_authority: Option<String>,
 }
 
 /// Everything a connection needs: where to dispatch, how to transcode, and the policy.
@@ -210,6 +213,7 @@ pub async fn serve_in_process(
         connect_auth: config.connect_auth,
         stream_auth: config.stream_auth,
         admin_reload_path: None,
+        upstream_authority: None,
     });
     run(listener, Runtime { backend: Backend::InProcess(routes), schema, cfg }).await
 }
@@ -218,6 +222,14 @@ pub async fn serve_in_process(
 pub async fn serve_proxy(listener: TcpListener, config: ProxyConfig) -> std::io::Result<()> {
     // Lazy connect: the upstream need not be up when we start.
     let channel = Channel::builder(config.upstream.clone()).connect_lazy();
+    // Raw host:port for the h2ts byte-pump path (which bypasses the gRPC `Channel`).
+    let upstream_authority = config.upstream.authority().map(|a| match a.port_u16() {
+        Some(_) => a.to_string(),
+        None => {
+            let port = if config.upstream.scheme_str() == Some("https") { 443 } else { 80 };
+            format!("{}:{}", a.host(), port)
+        }
+    });
     // A bad bundled descriptor set is a config error — surface it at startup.
     let schema = Schema::build(config.schema.clone(), channel.clone(), config.reflection_ttl)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -232,6 +244,7 @@ pub async fn serve_proxy(listener: TcpListener, config: ProxyConfig) -> std::io:
         connect_auth: None,
         stream_auth: None,
         admin_reload_path: config.admin_reload_path,
+        upstream_authority,
     });
     run(listener, Runtime { backend: Backend::Upstream(channel), schema, cfg }).await
 }

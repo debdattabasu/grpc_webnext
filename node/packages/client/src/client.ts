@@ -12,6 +12,7 @@ import { Metadata } from "./metadata.js";
 import { ServiceError, Status } from "./status.js";
 import type { StatusResult, Transport, TransportCallOptions } from "./transport.js";
 import { WebSocketTransport } from "./ws-transport.js";
+import { H2tsTransport } from "./h2ts-transport.js";
 
 /** Per-call options, mirroring the subset of grpc-js `CallOptions` we support. */
 export interface CallOptions {
@@ -37,6 +38,12 @@ export interface ClientOptions {
   multiplex?: boolean;
   /** WebSocket pool size when `multiplex` is set. Default 1. */
   poolSize?: number;
+  /**
+   * Run the binary path over **real gRPC via h2ts** (HTTP/2 tunneled over one
+   * WebSocket) for both unary and streaming — the `{ unary: h2ts, streaming: h2ts }`
+   * default. Requires the proto codec. Off by default while this lands.
+   */
+  h2ts?: boolean;
 }
 
 type Serialize<T> = (value: T) => Uint8Array;
@@ -52,6 +59,17 @@ export class Client {
   private readonly streamTransport: Transport;
 
   constructor(options: ClientOptions) {
+    // Binary over real gRPC via h2ts: one multiplexed H2 connection serves both unary
+    // and streaming, so both transports are the same instance.
+    if (options.h2ts) {
+      const transport = new H2tsTransport({
+        baseUrl: options.baseUrl,
+        webSocketImpl: options.webSocketImpl,
+      });
+      this.unaryTransport = transport;
+      this.streamTransport = transport;
+      return;
+    }
     this.unaryTransport = new FetchTransport({
       baseUrl: options.baseUrl,
       maxMessageBytes: options.maxMessageBytes,
