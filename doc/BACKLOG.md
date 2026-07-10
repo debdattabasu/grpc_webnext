@@ -157,23 +157,21 @@ backed by a tonic `Routes`. Deferred:
   across frames, round-robin, no flow control. New `Frame` kind, additive. Solves both
   peak memory (bounded frames) and multiplex fairness (interleaving), but is opt-in —
   the *sender* must fragment, so it only helps clients that do.
-- [ ] **Proxy: stream large WS message payloads without buffering the whole frame.**
-  Distinct from fragmentation — a *transparent, proxy-only* peak-memory win that helps
-  **any** client (no wire change, no client cooperation). The proxy forwards `+proto`
-  opaquely, so it never needs the whole message; but tungstenite reads each WS frame
-  fully into memory before yielding it. Fix: read frames incrementally with **wslay**
-  (its `on_frame_recv_chunk_callback` delivers payload chunks; it handles masking /
-  control / continuation), peek just enough of the protobuf `Frame` envelope to reach
-  the payload length, and pipe the payload straight to the upstream gRPC frame via the
-  raw-h2 `StreamBody` pattern already used on the Fetch path. wslay is C with no crate —
-  needs a thin FFI wrapper crate. **Scope/caveats:** proxy-only (the native server
-  decodes messages, so it materializes them regardless); still needs the raw-h2 upstream
-  write; and it reintroduces multiplex head-of-line blocking (streaming one frame blocks
-  reading the next on that socket) — acceptable for single-stream and a deliberate
-  tradeoff for `+multi`, since fragmentation is the interleaving fix. The prost `Bytes`
-  change already made the payload a zero-copy slice of the frame buffer, but that buffer
-  is still the whole message — this removes that last materialization. Bounded by
-  `max_message_bytes`, so the win scales with how large messages are allowed to get.
+- [x] ~~**Proxy: stream large WS message payloads without buffering the whole frame.**~~
+  **Resolved by the h2ts integration.** The motivation was a proxy-only peak-memory win: the
+  proxy forwards `+proto` opaquely, so it never needs the whole message — only tungstenite's
+  read-frame-into-memory forced materialization. The fix envisioned here (drive **wslay**'s
+  `on_frame_recv_chunk_callback` to pipe payload chunks straight through) is now exactly what
+  the **default proto path** does: it runs over h2ts, and the proxy forwards it with
+  `h2ts_server::bridge` (`src/h2ts.rs`) — an opaque, zero-buffer, sub-frame byte pump to the
+  h2c upstream (wslay `no_buffering`; never holds a whole message). The old blocker ("wslay is
+  C with no crate — needs a thin FFI wrapper") is gone: it's vendored in `wslay-sys`, pulled in
+  via `h2ts-server`. **Deliberately not pursued** for the remaining custom-`Frame` proxy paths:
+  `proto` + `streaming:"ws"` still materializes each message, but it's an opt-out from the h2ts
+  default (use the default for the opaque win) — and `WsByteStream` can't serve it directly
+  because it erases the WS message boundaries the `Frame` protocol uses as delimiters (would
+  need an upstream h2ts API that preserves them). The `+json` proxy path can never be
+  incremental — it must transcode each message, so it materializes by definition.
 
 ## TypeScript client
 

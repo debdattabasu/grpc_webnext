@@ -8,12 +8,11 @@ suite: limits
 # harness selects the matching server profile; a server that cannot honor a
 # profile marks the case SKIPPED (surfaced in the report — never silently passed).
 cases:
-  # KNOWN GAP (surfaced by the conformance run): response-size enforcement is not uniform.
-  # `max_message_bytes` currently bounds inbound *request* messages on the custom Frame
-  # path; the h2ts binary path uses real gRPC's own limits and does not route responses
-  # through grpc-webnext's size check. So an oversize *response* is not rejected with
-  # RESOURCE_EXHAUSTED on every path. Re-add an oversize-response case once that policy is
-  # settled (see conformance/README.md "Known gaps").
+  # BY DESIGN: `max_message_bytes` bounds inbound *request* messages only. On the custom Frame
+  # path the request body is size-checked directly; on the h2ts binary path a GrpcSizeLimit
+  # wrapper checks the gRPC frame length prefix above the tunnel. Response size is NOT enforced
+  # and does not need to be (real gRPC over h2ts uses tonic's own limits). There is deliberately
+  # no oversize-response case (see conformance/README.md "Design notes").
 
   # An oversize REQUEST message is rejected with RESOURCE_EXHAUSTED on every path: fetch/ws
   # bound the request body, and the h2ts path checks the gRPC frame length prefix.

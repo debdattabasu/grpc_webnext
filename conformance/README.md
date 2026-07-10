@@ -97,14 +97,15 @@ Each case runs under every applicable **transport profile**: `proto/h2ts` (real 
 the h2ts tunnel), `proto/ws` (the custom `Frame` path, unary over Fetch), and `json` (the
 custom path, Fetch + WS). 45 case×profile runs, all green.
 
-**Known gaps** (surfaced by the run — tracked, not silently passed):
-- **Response-size enforcement.** `max_message_bytes` now bounds inbound *request* messages on
-  every path (fetch/ws bound the request body; the h2ts path checks the gRPC frame length
-  prefix). But an oversize *response* isn't rejected — the custom paths don't check outbound
-  message size and the h2ts path leaves it to tonic's own encode limit. Also, a *mid-upload*
-  request rejection surfaces as a stream/transport failure rather than a clean
-  RESOURCE_EXHAUSTED on the Fetch/h2ts paths (inherent HTTP/2 semantics), so the case asserts
-  only that it was rejected. Settle the response-size policy, then extend.
+**Design notes** (surfaced by the run — behavior pinned, not gaps):
+- **Size limits are request-only, by design.** `max_message_bytes` bounds inbound *request*
+  messages on every path — fetch/ws bound the request body; the h2ts path checks the gRPC
+  frame length prefix above the tunnel (`GrpcSizeLimit` in `src/h2ts.rs`). Response size is
+  **not** enforced and does not need to be (real gRPC over h2ts uses tonic's own limits), so
+  there is deliberately no oversize-response case. Note a *mid-upload* request rejection
+  surfaces as a stream/transport failure rather than a clean RESOURCE_EXHAUSTED on the
+  Fetch/h2ts paths (inherent HTTP/2 semantics), so the oversize-request case asserts only
+  that it was rejected.
 
 The first run also **found two real bugs, now fixed**: trailing metadata on a trailers-only
 (error) response was dropped on the h2ts client and the Fetch server path (both read
