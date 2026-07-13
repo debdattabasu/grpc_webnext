@@ -267,6 +267,13 @@ The `4000 + code` **close code** is used only for **connection-level** rejection
 handshake (e.g. a missing codec subprotocol → `4012`), never for these per-stream errors on
 an open connection.
 
+**Single-stream teardown.** Once a stream reaches its terminal frame (`Trailer` or `Reset`),
+the server closes the WebSocket with a **normal `1000`** close — a WebSocket carries exactly
+one stream (proto or json), so it has served its purpose. The status has already been
+delivered in the terminal frame, so the close carries no status. (This is the single-stream
+analog of a stream-level teardown; the multiplexed h2ts path is a separate connection the
+server never owns, so it is not closed per-stream.)
+
 ### Fetch error surfaces (no transcoder)
 
 - `+json`/JSON with **no** transcoder/schema configured → **`UNIMPLEMENTED` in the

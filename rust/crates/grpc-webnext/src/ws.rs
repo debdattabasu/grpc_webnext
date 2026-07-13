@@ -239,6 +239,7 @@ async fn run_stream(
             Ok(tc) => Some(tc),
             Err(status) => {
                 send_reset(&outbound_tx, json, status.code(), status.message()).await;
+                let _ = outbound_tx.send(close_normal()).await;
                 return;
             }
         }
@@ -347,6 +348,12 @@ async fn run_stream(
         }
         None => pump.await,
     }
+
+    // One WebSocket carries exactly one stream: now that the RPC has terminated (a `Trailer`
+    // or `Reset` was delivered above), close the socket — proto and json alike. This is the
+    // stream-level teardown for a single-stream connection. (The h2ts binary path is a
+    // separate, multiplexed connection we never own, so it is untouched by this.)
+    let _ = outbound_tx.send(close_normal()).await;
 }
 
 async fn send_reset(outbound_tx: &mpsc::Sender<TungMessage>, json: bool, code: Code, message: &str) {
@@ -357,6 +364,15 @@ async fn send_reset(outbound_tx: &mpsc::Sender<TungMessage>, json: bool, code: C
         })),
     };
     let _ = outbound_tx.send(to_tung(&frame, json)).await;
+}
+
+/// A normal WebSocket close (code `1000`): the single stream on this connection has
+/// terminated (its status already delivered as a `Trailer`/`Reset`), so the socket is done.
+fn close_normal() -> TungMessage {
+    TungMessage::Close(Some(CloseFrame {
+        code: CloseCode::Normal,
+        reason: String::new().into(),
+    }))
 }
 
 /// A close frame that carries a gRPC status to browser JS: private close code `4000 + code`
