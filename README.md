@@ -2,7 +2,7 @@
 
 # grpc-webnext
 
-**Full gRPC in the browser — real HTTP/2, REST, and WebSockets, on the same port as native gRPC.**
+**Full bidirectional gRPC in the browser — real HTTP/2, REST, and WebSockets, on the same port as native gRPC.**
 
 [![Spec](https://img.shields.io/badge/spec-normative-success.svg)](spec/PROTOCOL.md)
 [![Conformance](https://img.shields.io/badge/conformance-passing-brightgreen.svg)](conformance/)
