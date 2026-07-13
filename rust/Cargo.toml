@@ -10,7 +10,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/grpc-webnext/grpc-webnext"
 
 [workspace.dependencies]

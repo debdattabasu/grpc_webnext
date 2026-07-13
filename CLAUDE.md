@@ -62,6 +62,38 @@ The in-process server (wrap a tonic `Routes`) and the standalone proxy (front an
 upstream) share one code path via a two-variant `Backend` enum
 (`InProcess(Routes)` | `Upstream(Channel)`).
 
+## Audit process
+
+Conformance proves wire-level interop, but it can't catch *subtle* divergence — a
+receive-path branch one implementation handles and another silently doesn't, an edge the
+spec implies but no test exercises, a behavior that has quietly drifted from the spec's
+intent. Two practices catch that:
+
+- **Fresh-context audits.** Periodically a fresh agent — no prior conversation, no
+  assumptions carried in — is given the broad **system invariants** (the guarantees in
+  `spec/PROTOCOL.md`, the polyglot *share-no-code / stay-interoperable* rule, and the
+  intended behavior of each layer: Fetch unary, the custom single-stream `Frame`
+  WebSocket, and the real-HTTP/2 h2ts path) and asked to evaluate the **current** state of
+  the spec, the tests, and the code against them. It reads the source and tests across
+  every stack and reports two things: **logic drift** — where implementations diverge from
+  each other or from the spec (the in-process/proxy unification audit found *four* such
+  divergences) — and **test-coverage gaps** — paths that are plausible but unproven. Each
+  audit is a dated document under `doc/` with a work log that turns every finding into a
+  fix or a recorded decision; `doc/STATUS.md` is the running example. Real bugs surface
+  exactly this way — the conformance suite's first run found trailing metadata dropped on a
+  trailers-only (error) response, on *both* the h2ts client and the Fetch server path, in
+  precisely the neighborhood the matrix was built to stress.
+- **Author coverage review.** The author also audits test coverage by hand on a regular
+  basis, hunting the edge cases conformance and automated tooling tend to miss —
+  receive-path robustness, lifecycle/teardown (single-stream WS close, cancellation,
+  deadline expiry), size-limit enforcement, and metadata fidelity (`-bin`, trailers-only)
+  that only surface under an adversarial reading.
+
+Assume any change will be read this way. Leave the spec, the tests, and the code mutually
+consistent, and prefer pinning an edge with a test over trusting that it's "obviously
+correct" — the audits exist precisely because obvious-looking code is where the drift
+hides.
+
 ## Conventions & gotchas
 
 - The Cargo workspace is in `rust/`, not the repo root — `cargo` commands run from there;
@@ -72,4 +104,17 @@ upstream) share one code path via a two-variant `Backend` enum
   (run every server impl × every client driver over the real wire).
 - gRPC status codes are canonical; WS pre-RPC rejection uses close code `4000 + code`.
 - macOS BSD `sed` has no `\b` word boundaries — don't use them in scripts here.
-```
+
+## A note on how this was built
+
+grpc-webnext is developed in collaboration with **Claude (Anthropic's Claude Code)** —
+architectural design, constraints, and direction are driven entirely by the author, with
+Claude accelerating implementation, testing, and documentation across the Rust,
+TypeScript, and Go stacks. Maintaining this CLAUDE.md is a choice to be upfront about that
+leverage rather than burying it.
+
+While AI-assisted authorship is often met with justified suspicion regarding code quality,
+grpc-webnext doesn't rely on blind generation. The work stands on its language-neutral
+[conformance suite](conformance/) — every server implementation × every client driver ×
+every transport and codec, run over the real wire — and the rigorous, human-in-the-loop
+adversarial audit process above. AI is the leverage; human verification is the guarantee.

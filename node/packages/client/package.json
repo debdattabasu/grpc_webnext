@@ -2,6 +2,7 @@
   "name": "@grpc-webnext/client",
   "version": "0.1.0",
   "description": "grpc-webnext TypeScript client (browser + node): Fetch unary, WebSocket streaming.",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
