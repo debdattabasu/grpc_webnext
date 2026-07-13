@@ -75,22 +75,70 @@ backed by a tonic `Routes`. Deferred:
 
 ## Auth
 
-- [x] ~~WebSocket connection-time auth (hard reject).~~ `ServerConfig::connect_auth`
-  inspects the handshake headers (the `Sec-WebSocket-Protocol` subprotocol list —
-  the only header browser JS can set). On rejection the server accepts the upgrade
-  then immediately closes with a **private close code `4000 + gRPC code`** and the
-  status message as the close reason, so browser JS reads a real status off
-  `CloseEvent.code`/`.reason` instead of a blind `1006`. No stream state is created,
-  so the cost matches a refused upgrade. The TS client carries a token as a
-  `bearer.<token>` subprotocol (`subprotocolToken` option). Both the native server
-  and the proxy echo the `grpc-webnext` subprotocol. Covered by `server/tests/auth.rs`.
-- [x] ~~Per-stream authorization.~~ `ServerConfig::stream_auth` runs on every
-  `Subscribe` against the call's method + metadata; rejection answers that stream
-  with `Reset{ <code> }` (the authoritative, gRPC-faithful check). Covered by
-  `server/tests/auth.rs`.
-- [ ] **Proxy-side auth hooks** — the proxy has no `connect_auth`/`stream_auth`
-  equivalents yet (it forwards opaquely). Add if the proxy needs to gate independently
-  of the upstream.
+- [x] ~~WebSocket connection-time auth (`connect_auth`).~~ **Removed** — a connection-scoped
+  app-credential gate is non-canonical (the ecosystem gates connections only on network
+  identity, e.g. mTLS) and can't be uniform (Fetch has no connection), so it was a footgun.
+  With it went the `bearer.<token>` subprotocol machinery (`ws_bearer_token`, the client's
+  subprotocol derivation). Auth is now purely per-RPC at the router; a browser credential
+  needed at the edge travels as request metadata (or dynamic metadata via an Envoy filter,
+  below). The `4000 + code` handshake close remains for codec/surface rejections. See
+  `spec/PROTOCOL.md` "Auth".
+- [x] ~~Per-stream authorization.~~ **Removed** — a grpc-webnext-specific `stream_auth`
+  hook was redundant with a tonic interceptor, which the request already reaches on every
+  transport (and which, unlike the hook, also covers the native/h2ts path). Per-RPC auth is
+  now a router interceptor (in-process) / the upstream server (proxy). Pinned by
+  `tests/inproc_auth.rs::tonic_interceptor_guards_both_grpc_webnext_surfaces`.
+- [x] ~~Proxy-side per-stream auth hooks~~ — moot: proxy per-RPC auth is the upstream
+  server's interceptors; the proxy forwards metadata opaquely.
+
+## Envoy integration (dynamic-module filters)
+
+Goal: a user runs **stock Envoy** — no sidecar process, no custom Envoy build — and the
+grpc-webnext browser transports are terminated **inside** Envoy by runtime-loaded native
+**dynamic modules** (Rust SDK; `.so` located via `ENVOY_DYNAMIC_MODULES_SEARCH_PATH`).
+After termination the traffic is ordinary HTTP/2 gRPC, so Envoy does routing, `ext_authz`,
+rate-limit, LB, and tracing natively and grpc-webnext does **zero** L7 — the same clean split
+the proxy already has (it already translates every path to clean gRPC; see `src/h2ts.rs`,
+`fetch.rs`, `ws.rs`). This is the ecosystem analog of Envoy's own `grpc_web` filter; the wire
+contract is `spec/PROTOCOL.md`, so each filter is a **port of the existing translation logic**
+(and h2ts's wslay bridge), not new semantics. Dynamic modules confirmed to support HTTP **and
+network** filters (docs), but are "under active development", so treat the ABI specifics as
+needing verification.
+
+- [x] ~~Spike: confirm the load-bearing network-filter ABI capabilities.~~ **Confirmed** in
+  the SDK (`EnvoyNetworkFilter` trait, envoyproxy/envoy Rust SDK, verified against the pinned
+  rev). Read path: `get_read_buffer_chunks` + `drain_read_buffer` consume the inbound WS bytes;
+  **`inject_read_data(data, end_stream)` — "inject data into the read filter chain (after this
+  filter)"** forwards the de-framed h2c to the next filter (HCM). Downstream write:
+  **`write(data, end_stream)` — "write directly to the connection (downstream)"** emits the
+  `101` + outbound WS frames; response re-framing uses `get_write_buffer_chunks` /
+  `drain_write_buffer` / `inject_write_data`. Lifecycle via `on_new_connection` / `on_event` /
+  `close`. **Bonus:** the filter can stash handshake material — SNI (`get_requested_server_name`),
+  cert SANs (`get_ssl_uri_sans`), a subprotocol token — into **dynamic metadata**
+  (`set_dynamic_metadata_*`) for Envoy `ext_authz`/RBAC, a clean bridge for browser-handshake
+  credentials. **Caveat:** the SDK is **version-locked** to Envoy (git dep pinned to a rev,
+  strict ABI compat) — the module builds against a matching Envoy release.
+- [ ] **Fetch (unary / server-stream) → HTTP filter.** grpc-web-shaped body translation:
+  rewrite the length-prefixed request into gRPC and buffer the response trailer into the
+  `[msg][trailer]` body (browsers can't read trailers). 1 request = 1 stream → an in-place
+  transform. Easiest path; directly analogous to `grpc_web`. Likely viable in Wasm too, but
+  a Rust dynamic module keeps one toolchain.
+- [ ] **Custom-Frame WS → filter (single-stream 1:1).** Decode `Frame` protobufs off the WS
+  upgrade and map the one WS to one gRPC stream (Subscribe→HEADERS, Message→DATA, response→
+  Header/Message/Trailer frames). Retiring multiplexing made this a clean 1:1 map.
+- [ ] **h2ts → network filter before HCM.** Run the wslay de-frame (own the WS handshake +
+  framing) as a **network** filter and hand the inner h2c byte stream to a downstream
+  `HttpConnectionManager` (codec `HTTP2`), which natively demuxes it into N routed streams —
+  so "1 WS → N streams" is HCM's job, not the filter's. Essentially h2ts-server's `accept` +
+  `bridge` ported to the Envoy net-filter ABI — **confirmed viable** by the spike above
+  (`inject_read_data` forwards h2c to HCM; `write` emits the `101`/WS frames).
+- [ ] **Deployment doc + client-profile guidance.** Topology: browser → stock Envoy (these
+  filters terminate) → routing/authz/LB. Document the h2c details the filters must set for
+  Envoy routing/authz (`:path`, `:authority`, `content-type`, `te`, metadata pass-through),
+  and the transport split: behind a mesh any client profile is terminable; for
+  **direct-to-server** (no Envoy) h2ts stays the default. Note Wasm can host network filters
+  too but is impractical for a high-throughput H2 tunnel (per-byte VM boundary) — dynamic
+  modules (Rust, native) are the chosen mechanism.
 
 ## HTTP transcoding (`google.api.http`)
 
@@ -136,14 +184,9 @@ backed by a tonic `Routes`. Deferred:
   TS client all implement both; covered by `server/tests/json.rs`
   (`streaming_json_round_trip`, `ws_multiplex_two_streams`), `proxy/tests/*`, and the
   TS e2e (`multiplex: two concurrent streams`).
-- [x] ~~WebSocket handshake auth gate (method-scoped).~~ Auth is per-stream (`stream_auth`
-  on the open-frame metadata); the WS handshake gate is an *optional early reject*. The TS
-  client derives a `bearer.<token>` subprotocol from the call's `authorization` metadata;
-  the server runs `connect_auth(method, headers)` (read the token via `ws_bearer_token`)
-  **only when a credential is present**, scoped to the method — the URL path (single-stream)
-  or a `?method=` query (multiplexed). A credential with no resolvable method is a hard
-  reject; a credential-less connection just opens. Covered by
-  `clients/typescript/test/auth-subprotocol.test.ts` and `server/tests/auth.rs`
+- [x] ~~WebSocket handshake auth gate (method-scoped).~~ **Removed** with `connect_auth`
+  (above) — auth is per-RPC at the router on every transport, with no WS-handshake gate.
+  (This item also predated single-stream; the `?method=` multiplex variant is gone too.)
   (`connect_gate_*`, `multiplex_auth_*`, `no_credential_opens_the_connection`).
 - [ ] **WS pool never reaps idle connections** (multiplex mode).
 
