@@ -137,17 +137,13 @@ ping with a pong. Changes:
   to: JSON omits it from the wire, binary carries it fixed at `1` (protobuf has no
   field omission), and the server ignores the wire value in single-stream mode
   either way.
-- **"Fetch is the same" for auth** (code fix — this one was a real gap, not just
-  wording): `stream_auth` used to run only on the WebSocket `Subscribe` path, so a
-  server that registered it had an **unauthenticated Fetch surface**. Now
-  `fetch_stream_auth` runs the same hook on the grpc-webnext Fetch surface —
-  `unary` (`+proto`) and `json_unary_call` (`+json` and REST-transcoded) in
-  `crates/server/src/lib.rs` — rejecting with the hook's status carried per the
-  codec. Native `application/grpc` passthrough is deliberately exempt (raw gRPC
-  surface, guarded by the router's interceptors). Covered by
-  `crates/server/tests/auth.rs`: `fetch_stream_auth_rejects_bad_token`,
-  `fetch_stream_auth_admits_good_token`, and
-  `fetch_native_passthrough_is_exempt_from_stream_auth`.
+- **"Fetch is the same" for auth** (code fix, now **superseded**): `stream_auth` used to
+  run only on the WebSocket `Subscribe` path, so a server that registered it had an
+  **unauthenticated Fetch surface**; the fix ran the same hook on Fetch too. `stream_auth`
+  was later **removed entirely** — it was redundant with a tonic interceptor, which the
+  request already reaches on every transport (and which, unlike the hook, also covers the
+  native/h2ts path). Per-RPC auth is now a router interceptor / the upstream server; pinned
+  by `tests/inproc_auth.rs::tonic_interceptor_guards_both_grpc_webnext_surfaces`.
 - **`Reset{ UNAUTHENTICATED }` isn't hardcoded** (doc fix): clarified that the
   Reset (WS) / `grpc-status` (Fetch) carries whatever `Status` the hook returns —
   any code, e.g. `PERMISSION_DENIED` for a valid-but-unauthorized token.
@@ -238,9 +234,8 @@ draft — the corrections are folded in here and in the doc.
   initial payload). `-bin` metadata is silently dropped crossing into the JSON codec.
 - **Encoding details**: `grpc-message` headers are percent-encoded (alnum + space
   `-_./:` pass, else `%XX`) on the JSON Fetch path only; close reasons truncate to
-  123 bytes on a UTF-8 boundary (native server only — the proxy has no close path);
-  "token-safe" for `bearer.<token>` means RFC 7230 token chars, embedded raw,
-  matched against a case-sensitive lowercase `bearer.` prefix.
+  123 bytes on a UTF-8 boundary (native server only — the proxy has no close path).
+  (The `bearer.<token>` subprotocol was later removed with `connect_auth`.)
 - **Pool behavior**: in `+multi` mode the client opens a new socket per stream until
   `poolSize` is reached, then round-robins — the doc described steady state only.
 - **Query params are ignored when `body: "*"`** in REST transcoding; path vars
@@ -295,14 +290,12 @@ minor one remains.
   limit is tested, TS client's isn't), the `FetchTransport.startStream` throw,
   `poolSize > 1` round-robin distribution, `grpc-timeout` header emission on
   Fetch unary (deadline tests all go through streaming).
-- **Fetch-path auth**: covered as of the smaller-inaccuracies fix — `auth.rs` now
-  exercises `stream_auth` on Fetch (reject, admit, passthrough-exempt).
+- **Per-RPC auth**: `stream_auth` was removed (redundant with a tonic interceptor);
+  `inproc_auth.rs` now pins that a router interceptor guards the Fetch and WS surfaces.
 - **Close-event handling**: covered as of drift 2's fix
-  (`test/ws-close-status.test.ts`). Remaining gap: no full cross-language e2e of
-  a *native-server* handshake reject reaching the client, because the e2e
-  `devserver` fronts the upstream with the proxy (no `connect_auth` gate); the
-  reject path is covered on the Rust side (`crates/server/tests/auth.rs:89-99`)
-  and the client decode by the real-`ws` test.
+  (`test/ws-close-status.test.ts`) — the client reconstructs a gRPC status from a
+  `4000 + code` handshake close. (The connect-auth reject path that also exercised this was
+  since removed; the close now carries codec/surface rejections.)
 
 The through-line: happy paths are well covered on both sides of the wire;
 almost every gap is a rejection or limit branch — exactly the branches that

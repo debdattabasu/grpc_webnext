@@ -211,35 +211,22 @@ ping/pong frame (the `Frame` oneof reserves the old field numbers 6/7).
 
 ### Auth
 
-Auth is **per stream** (like gRPC call credentials / grpc-web — the browser has no
-connection-level credential it can drive). `ServerConfig::stream_auth` is the
-authoritative check, run on **every grpc-webnext stream on both transports** — each
-WebSocket `Subscribe` and each unary Fetch call (a unary RPC is a one-shot stream). It
-receives the method and the request metadata (`authorization` rides in the `Subscribe`
-frame on WebSocket, or the HTTP request headers on Fetch) and returns a `Status`. That
-status is not hardcoded to `UNAUTHENTICATED`: the hook may return any code (e.g.
-`PERMISSION_DENIED` for a valid-but-unauthorized token). On WebSocket a failure becomes
-a `Reset` carrying that status; on Fetch it becomes the response's `grpc-status` (so a
-denied `+proto` call still returns HTTP 200 with the status in the trailer block, and a
-`+json` call carries it in the `grpc-status` header). Native `application/grpc`
-passthrough is **exempt** — that's the raw gRPC surface, guarded by the router's own
-interceptors, not a grpc-webnext-translated stream.
+Authorization is **not** a grpc-webnext protocol feature — there are **no** auth hooks,
+per-RPC or per-connection. Every request carries its metadata into the router on every
+transport — HTTP request headers on Fetch, the `Subscribe` frame's metadata on WebSocket,
+real HTTP/2 headers on the native/h2ts path — so authorization belongs in the **router**: a
+tonic interceptor (in-process) or the upstream server / mesh (proxy). One check there covers
+**all** transports uniformly, and its `Status` propagates the normal way — a WebSocket
+`Trailer`, or a Fetch `grpc-status` (a denied `+proto` call still returns HTTP 200 with the
+status in the trailer block; `+json` carries it in the `grpc-status` header). Per standard
+HTTP/2 semantics a per-RPC rejection is a **stream-level** event: the status is returned on
+that stream and the connection is **not** torn down.
 
-On WebSocket there's an **optional handshake gate** so a bad credential can be rejected
-*before any frame is read*. A browser can set only one handshake header —
-`Sec-WebSocket-Protocol` — so the client auto-derives a `bearer.<token>` subprotocol from
-the call's `authorization` metadata (stripping a `Bearer ` scheme; non-token-safe
-credentials are skipped and just flow in the frame). It fires **only when that credential
-is present**; the method it scopes to is **the URL path** — unambiguous, since the socket
-*is* the stream. With **no credential** the connection just opens and the stream
-self-authenticates from its `Subscribe` frame (per-stream `stream_auth`).
-
-`ServerConfig::connect_auth(method, headers)` runs the gate (read the token with the
-`ws_bearer_token` helper). On `Err(status)` the server **accepts the upgrade then
-immediately closes** with a private code **`4000 + gRPC status`** (`4016` UNAUTHENTICATED),
-message in the reason — JS reads `CloseEvent.code`/`.reason` and reconstructs a `Status`;
-no stream is created. This is a WebSocket-specific early-reject optimization, not a
-gRPC connection-auth layer (gRPC's connection auth is mTLS, which browser JS can't drive).
+This mirrors the ecosystem: application auth is per-request everywhere (gRPC interceptors,
+Envoy `ext_authz`, nginx `auth_request`), and the only connection-level gate is **mTLS** — a
+transport gate at connect time, which browser JS can't drive. grpc-webnext therefore ships
+no connection-level auth hook. A browser credential that must be evaluated at the edge (e.g.
+by a mesh) travels as ordinary request metadata to per-request authz.
 
 ## Limits & error surfaces (wire-observable)
 
@@ -277,8 +264,8 @@ error status it returned). Both render to the same `{status}` JSON frame, so on 
 connection the distinction is invisible; it's observable only on a binary connection.
 
 The `4000 + code` **close code** is used only for **connection-level** rejections at the
-handshake (missing codec subprotocol → `4012`; auth-gate reject → `4016`), never for these
-per-stream errors on an open connection.
+handshake (e.g. a missing codec subprotocol → `4012`), never for these per-stream errors on
+an open connection.
 
 ### Fetch error surfaces (no transcoder)
 
@@ -311,12 +298,7 @@ Consequences:
   encoding applies there.
 - **WebSocket close reasons** truncate to **123 bytes** on a UTF-8 char boundary
   (WebSocket caps the reason at 123 bytes). The `4000 + code` close is sent for any
-  handshake-time rejection (missing codec subprotocol, or an in-process connect-auth failure).
-- **`bearer.<token>` subprotocol**: "token-safe" means RFC 7230 token chars (`tchar`). The
-  client strips a case-insensitive `Bearer ` scheme, then offers a **lowercase**
-  `bearer.<token>` subprotocol only if the remaining token is token-safe (otherwise the
-  credential just flows in the frame). The server matches the lowercase `bearer.` prefix
-  **case-sensitively**.
+  handshake-time rejection (e.g. a missing codec subprotocol).
 
 ### REST binding precedence
 

@@ -1,28 +1,21 @@
-//! WebSocket auth: connection-level handshake gate (subprotocol credential ->
-//! close frame with a gRPC status) and per-stream authorization (Subscribe
-//! metadata -> Reset).
-
-use std::sync::Arc;
+//! Authorization is not a grpc-webnext concern. The request carries its metadata into the
+//! router on every transport, so per-RPC auth is a standard tonic interceptor (in-process) /
+//! the upstream server or mesh (proxy) — there are **no** grpc-webnext auth hooks (neither
+//! per-RPC nor per-connection). This test pins that an interceptor fires on the grpc-webnext
+//! Fetch and WebSocket surfaces, exactly as it does on the native/h2ts path.
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use grpc_webnext::pb::{frame::Kind, Frame, Subscribe};
 use grpc_webnext::{decode_frame, decode_response_body, encode_frame, encode_request_body};
-use grpc_webnext::{bind_and_serve_in_process, ws_bearer_token, ServerConfig, CT_PROTO};
+use grpc_webnext::{bind_and_serve_in_process, ServerConfig, CT_PROTO};
 use prost::Message as _;
-use testecho::pb::echo_client::EchoClient;
 use testecho::pb::echo_server::EchoServer;
 use testecho::pb::{EchoRequest, EchoResponse};
 use testecho::EchoSvc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tonic::{Code, Status};
-
-async fn start(config: ServerConfig) -> String {
-    let routes = tonic::service::Routes::new(EchoServer::new(EchoSvc::default()));
-    let (addr, _handle) = bind_and_serve_in_process(routes, config).await.unwrap();
-    format!("ws://{addr}")
-}
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type Resp = tokio_tungstenite::tungstenite::handshake::client::Response;
@@ -60,155 +53,6 @@ fn half_close() -> TungMessage {
     }))
 }
 
-/// A connect gate (only fires when a `bearer.*` credential is present) that admits
-/// only `bearer.good`, scoped to the resolved method.
-fn bearer_good_gate() -> ServerConfig {
-    ServerConfig {
-        connect_auth: Some(Arc::new(|method: &str, headers: &http::HeaderMap| {
-            assert!(!method.is_empty(), "connect_auth is scoped to a method");
-            match ws_bearer_token(headers).as_deref() {
-                Some("good") => Ok(()),
-                _ => Err(Status::unauthenticated("bad token")),
-            }
-        })),
-        // These tests exercise auth, not codec gating; allow implicit codecs so the
-        // plain (no codec subprotocol) connections aren't rejected first.
-        allow_implicit_codec: true,
-        ..Default::default()
-    }
-}
-
-async fn read_close(ws: &mut Ws) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
-    while let Some(msg) = ws.next().await {
-        if let TungMessage::Close(cf) = msg.unwrap() {
-            return cf.expect("close frame carries a gRPC status");
-        }
-    }
-    panic!("expected a close frame");
-}
-
-#[tokio::test]
-async fn connect_gate_rejects_bad_token_with_close_status() {
-    let url = start(bearer_good_gate()).await;
-    // A credential is presented (bearer.bad) scoped to the method URL -> gate rejects.
-    let (mut ws, _) =
-        connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext, bearer.bad")).await;
-    let cf = read_close(&mut ws).await;
-    // UNAUTHENTICATED (16) -> private close code 4016, message in the reason.
-    assert_eq!(u16::from(cf.code), 4000 + Code::Unauthenticated as u16);
-    assert_eq!(cf.reason.as_str(), "bad token");
-}
-
-#[tokio::test]
-async fn no_credential_opens_the_connection() {
-    // No `bearer.*` subprotocol -> the connection opens even though connect_auth is
-    // configured; the stream self-authenticates per call.
-    let url = start(bearer_good_gate()).await;
-    let (mut ws, _) = connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
-    ws.send(subscribe(&[])).await.unwrap();
-    ws.send(half_close()).await.unwrap();
-    let (code, _) = read_until_status(&mut ws).await.expect("expected a status");
-    assert_eq!(code, 0);
-}
-
-#[tokio::test]
-async fn connect_gate_admits_valid_token_and_echoes_subprotocol() {
-    let url = start(bearer_good_gate()).await;
-    // Single-stream: the URL is the route; carry the credential in the subprotocol
-    // list (plus the base `grpc-webnext`), like a browser would.
-    let (mut ws, resp) =
-        connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext, bearer.good")).await;
-
-    // Server negotiated our subprotocol on the 101.
-    assert_eq!(
-        resp.headers().get("sec-websocket-protocol").unwrap(),
-        "grpc-webnext",
-    );
-
-    // The stream works: unary echo round-trips (half-close ends the request).
-    ws.send(subscribe(&[])).await.unwrap();
-    ws.send(half_close()).await.unwrap();
-    let (code, _) = read_until_status(&mut ws).await.expect("expected a status");
-    assert_eq!(code, 0);
-}
-
-#[tokio::test]
-async fn single_stream_stream_auth_rejects_with_reset() {
-    // stream_auth also gates single-stream connections, off the open-frame metadata.
-    let config = ServerConfig {
-        stream_auth: Some(Arc::new(|_m: &str, md: &tonic::metadata::MetadataMap| {
-            match md.get("authorization").and_then(|v| v.to_str().ok()) {
-                Some("Bearer good") => Ok(()),
-                _ => Err(Status::unauthenticated("stream denied")),
-            }
-        })),
-        allow_implicit_codec: true,
-        ..Default::default()
-    };
-    let url = start(config).await;
-    // No bearer (so connect_auth doesn't apply); the open frame carries no auth metadata.
-    let (mut ws, _) = connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
-    // The Subscribe alone triggers the auth check — no half-close needed (and the socket
-    // closes right after the reject, so a follow-up send would race the teardown).
-    ws.send(subscribe(&[])).await.unwrap();
-    let (code, msg) = read_until_status(&mut ws).await.expect("status");
-    assert_eq!(code, Code::Unauthenticated as u32);
-    assert_eq!(msg, "stream denied");
-}
-
-#[tokio::test]
-async fn stream_auth_reject_closes_the_socket() {
-    // A failed per-stream auth check hands the client the gRPC status as a Reset, then
-    // closes the connection with the same status in the close code (4000 + code) — so an
-    // unauthorized client can't keep the socket around. Mirrors the connect-gate door-slam.
-    let config = ServerConfig {
-        stream_auth: Some(Arc::new(|_m: &str, _md: &tonic::metadata::MetadataMap| {
-            Err(Status::permission_denied("nope"))
-        })),
-        allow_implicit_codec: true,
-        ..Default::default()
-    };
-    let url = start(config).await;
-    let (mut ws, _) = connect(&format!("{url}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
-    ws.send(subscribe(&[])).await.unwrap();
-
-    // Drain to the close: a Reset carrying the status arrives first, then the Close frame.
-    let mut saw_reset = false;
-    let cf = loop {
-        match ws.next().await {
-            Some(Ok(TungMessage::Binary(data))) => {
-                if let Some(Kind::Reset(r)) = decode_frame(&data).unwrap().kind {
-                    assert_eq!(r.status_code, Code::PermissionDenied as u32);
-                    assert_eq!(r.status_message, "nope");
-                    saw_reset = true;
-                }
-            }
-            Some(Ok(TungMessage::Close(cf))) => break cf.expect("close carries a gRPC status"),
-            Some(Ok(_)) => {}
-            Some(Err(e)) => panic!("socket errored before a clean close: {e}"),
-            None => panic!("socket ended without a Close frame"),
-        }
-    };
-    assert!(saw_reset, "the stream status arrives as a Reset before the close");
-    assert_eq!(u16::from(cf.code), 4000 + Code::PermissionDenied as u16);
-    assert_eq!(cf.reason.as_str(), "nope");
-}
-
-// ---- Fetch-path per-stream auth: the same `stream_auth` hook guards unary Fetch ----
-
-/// A `stream_auth` gate admitting only `authorization: Bearer good`.
-fn stream_auth_good_gate() -> ServerConfig {
-    ServerConfig {
-        stream_auth: Some(Arc::new(|_m: &str, md: &tonic::metadata::MetadataMap| {
-            match md.get("authorization").and_then(|v| v.to_str().ok()) {
-                Some("Bearer good") => Ok(()),
-                _ => Err(Status::unauthenticated("stream denied")),
-            }
-        })),
-        ..Default::default()
-    }
-}
-
 /// POST a grpc-webnext `+proto` unary request; decode the framed `(message, trailer)`.
 async fn fetch_unary(base: &str, authorization: Option<&str>) -> (Bytes, u32, String) {
     let mut req = reqwest::Client::new()
@@ -228,46 +72,48 @@ async fn fetch_unary(base: &str, authorization: Option<&str>) -> (Bytes, u32, St
 }
 
 #[tokio::test]
-async fn fetch_stream_auth_rejects_bad_token() {
-    let base = start(stream_auth_good_gate()).await.replace("ws://", "http://");
-    let (_msg, code, message) = fetch_unary(&base, None).await;
-    assert_eq!(code, Code::Unauthenticated as u32);
-    assert_eq!(message, "stream denied");
-}
+async fn tonic_interceptor_guards_both_grpc_webnext_surfaces() {
+    // The standard (and only) per-RPC auth story: a tonic interceptor on the router. The
+    // request is rebuilt and dispatched to the router on every transport, so the interceptor
+    // sees the `authorization` metadata and its rejection propagates as a normal gRPC status
+    // (Fetch trailer / WS `Trailer`) — no grpc-webnext-specific hook. (The h2ts path is real
+    // gRPC straight into the router, so it's covered by tonic itself.)
+    fn auth(req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        match req.metadata().get("authorization").and_then(|v| v.to_str().ok()) {
+            Some("Bearer good") => Ok(req),
+            _ => Err(Status::unauthenticated("denied")),
+        }
+    }
+    let routes = tonic::service::Routes::new(EchoServer::with_interceptor(EchoSvc::default(), auth));
+    let (addr, _handle) = bind_and_serve_in_process(
+        routes,
+        ServerConfig { allow_implicit_codec: true, ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let http = format!("http://{addr}");
+    let ws = format!("ws://{addr}");
 
-#[tokio::test]
-async fn fetch_stream_auth_admits_good_token() {
-    let base = start(stream_auth_good_gate()).await.replace("ws://", "http://");
-    let (msg, code, message) = fetch_unary(&base, Some("Bearer good")).await;
-    assert_eq!(code, 0, "status: {message}");
+    // Fetch: denied without the token, admitted (and echoing) with it.
+    let (_m, code, _d) = fetch_unary(&http, None).await;
+    assert_eq!(code, Code::Unauthenticated as u32, "fetch denied without token");
+    let (msg, code, detail) = fetch_unary(&http, Some("Bearer good")).await;
+    assert_eq!(code, 0, "fetch admitted with token: {detail}");
     assert_eq!(EchoResponse::decode(msg).unwrap().message, "hi");
-}
 
-#[tokio::test]
-async fn fetch_native_passthrough_is_exempt_from_stream_auth() {
-    // stream_auth guards the grpc-webnext surface, not native application/grpc — that's
-    // the raw gRPC surface, guarded by the router's own interceptors. A real tonic
-    // client must still get through even with a deny-all stream_auth configured.
-    let base = start(stream_auth_good_gate()).await.replace("ws://", "http://");
-    let mut client = EchoClient::connect(base).await.unwrap();
-    let resp = client.unary(EchoRequest { message: "native".into() }).await.unwrap();
-    assert_eq!(resp.into_inner().message, "native");
-}
+    // WebSocket (custom Frame): the interceptor's rejection arrives as a stream status and
+    // the connection stays open (stream-level, per standard HTTP/2 semantics).
+    let (mut s, _) = connect(&format!("{ws}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
+    s.send(subscribe(&[])).await.unwrap();
+    s.send(half_close()).await.unwrap();
+    let (code, _) = read_until_status(&mut s).await.expect("status");
+    assert_eq!(code, Code::Unauthenticated as u32, "ws denied without token");
 
-#[test]
-fn ws_bearer_token_extracts_the_token() {
-    use grpc_webnext::ws_bearer_token;
-    let mut h = http::HeaderMap::new();
-    h.insert(
-        "sec-websocket-protocol",
-        "grpc-webnext, grpc-webnext+proto, bearer.abc.def-token".parse().unwrap(),
-    );
-    assert_eq!(ws_bearer_token(&h), Some("abc.def-token".to_string()));
-
-    // No bearer entry -> None.
-    let mut h2 = http::HeaderMap::new();
-    h2.insert("sec-websocket-protocol", "grpc-webnext+json".parse().unwrap());
-    assert_eq!(ws_bearer_token(&h2), None);
+    let (mut s, _) = connect(&format!("{ws}/echo.v1.Echo/Unary"), Some("grpc-webnext+proto")).await;
+    s.send(subscribe(&[("authorization", "Bearer good")])).await.unwrap();
+    s.send(half_close()).await.unwrap();
+    let (code, _) = read_until_status(&mut s).await.expect("status");
+    assert_eq!(code, 0, "ws admitted with token");
 }
 
 /// Drain frames until a terminal Trailer/Reset; returns (status_code, message).

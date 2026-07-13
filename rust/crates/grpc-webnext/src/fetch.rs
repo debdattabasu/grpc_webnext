@@ -25,7 +25,7 @@ use tonic::Status;
 
 use crate::ws::{self, WsParams};
 use crate::{
-    ws_bearer_token, ws_subprotocols, BoxError, ResBody, Runtime, CT_GRPC, CT_JSON, CT_PROTO,
+    ws_subprotocols, BoxError, ResBody, Runtime, CT_GRPC, CT_JSON, CT_PROTO,
     DEADLINE_GRACE, WS_SUBPROTOCOL, WS_SUBPROTOCOL_JSON, WS_SUBPROTOCOL_PROTO,
 };
 
@@ -152,19 +152,9 @@ async fn handle_ws_upgrade(rt: &Runtime, mut req: Request<Incoming>) -> Response
             Status::unimplemented("this websocket requires a grpc-webnext+proto or grpc-webnext+json subprotocol")
         })
     };
-    // Connection auth gate — only when the server does connect auth and the client presented
-    // a `bearer.*` credential. Single-stream: the method is the WS URL path (or annotation).
-    let auth_reject = match &rt.cfg.connect_auth {
-        Some(auth) if ws_bearer_token(req.headers()).is_some() => {
-            let auth_method = match &ws_annotation {
-                Some(ann) => ann.grpc_method().to_string(),
-                None => req.uri().path().to_string(),
-            };
-            auth(&auth_method, req.headers()).err()
-        }
-        _ => None,
-    };
-    let reject = auth_reject.or(codec_reject);
+    // Pre-RPC rejection: only codec/surface gating (auth is per-RPC at the router, not a
+    // handshake gate). A rejected handshake closes with a `4000 + code` close frame.
+    let reject = codec_reject;
 
     let echo = [WS_SUBPROTOCOL_PROTO, WS_SUBPROTOCOL_JSON, WS_SUBPROTOCOL, "application/json"]
         .into_iter()
@@ -207,11 +197,6 @@ async fn unary_proto(rt: &Runtime, req: Request<Incoming>) -> Response<ResBody> 
     };
     let deadline = metadata::parse_grpc_timeout(req.headers());
     let (parts, body) = req.into_parts();
-
-    // Per-stream auth, same hook as the WebSocket Subscribe path.
-    if let Some(resp) = fetch_stream_auth(rt, path.path(), &parts.headers, CT_PROTO) {
-        return resp;
-    }
 
     let grpc_body = match frame_upstream_request(body, rt.cfg.max_message_bytes).await {
         Ok(b) => b,
@@ -381,11 +366,6 @@ async fn json_upstream(
     resp_ct: &str,
     deadline: Option<std::time::Duration>,
 ) -> Response<ResBody> {
-    // Per-stream auth, same hook as the WebSocket Subscribe path.
-    if let Some(resp) = fetch_stream_auth(rt, grpc_path.path(), req_headers, resp_ct) {
-        return resp;
-    }
-
     let mut builder = Request::builder().method(http::Method::POST).uri(grpc_path.clone());
     for (name, value) in req_headers.iter() {
         if !metadata::is_denied(name) {
@@ -430,17 +410,6 @@ async fn json_upstream(
         Bytes::new()
     };
     json_fetch_response(resp_ct, json_body, status_code, &status_message, &resp_parts.headers, &trailer_headers)
-}
-
-/// Enforce the per-stream auth hook on a Fetch call. `Some(error)` when rejected (status
-/// carried per the codec: `+json` in headers, `+proto` in a trailer block).
-fn fetch_stream_auth(rt: &Runtime, method: &str, headers: &HeaderMap, resp_ct: &str) -> Option<Response<ResBody>> {
-    let auth = rt.cfg.stream_auth.as_ref()?;
-    let md = metadata::request_headers_to_metadata(headers);
-    match auth(method, &md) {
-        Ok(()) => None,
-        Err(status) => Some(webnext_error(resp_ct, status.code(), status.message())),
-    }
 }
 
 // --- Response helpers -------------------------------------------------------

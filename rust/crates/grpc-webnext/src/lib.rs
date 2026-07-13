@@ -19,10 +19,8 @@ use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tonic::metadata::MetadataMap;
 use tonic::service::Routes;
 use tonic::transport::Channel;
-use tonic::Status;
 
 // Inbound protocol translation.
 pub mod backend;
@@ -78,17 +76,12 @@ pub const DEADLINE_GRACE: Duration = Duration::from_millis(500);
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ResBody = UnsyncBoxBody<Bytes, BoxError>;
 
-// --- Auth hooks (in-process surface) ----------------------------------------
-
-/// Authorize a WebSocket connection at handshake time (see the connection-gate docs in
-/// `spec/PROTOCOL.md`). Given the gRPC method the credential is scoped to and the request
-/// headers; `Err(status)` closes the accepted socket with a `4000 + code` close frame.
-pub type ConnectAuthFn = Arc<dyn Fn(&str, &HeaderMap) -> Result<(), Status> + Send + Sync>;
-
-/// Authorize a single stream from its method path and request metadata. `Err(status)`
-/// answers that call with the status (a WS `Reset` / a Fetch `grpc-status`). The
-/// authoritative, gRPC-faithful check, run on every grpc-webnext stream on both transports.
-pub type StreamAuthFn = Arc<dyn Fn(&str, &MetadataMap) -> Result<(), Status> + Send + Sync>;
+// Authorization is deliberately NOT a grpc-webnext hook — neither per-RPC nor
+// per-connection. The request carries its metadata to the router on every transport, so
+// auth belongs in a tonic interceptor (in-process) or the upstream server / mesh (proxy):
+// one uniform, per-RPC check that also covers the native/h2ts path. Connection-level app
+// auth is non-canonical (the ecosystem gates connections only on network identity, e.g.
+// mTLS) and can't be uniform (Fetch has no connection). See `tests/inproc_auth.rs`.
 
 // --- Public configs ---------------------------------------------------------
 
@@ -100,10 +93,6 @@ pub struct ServerConfig {
     /// transcoded to the router's binary protobuf and back. `None` ⇒ `+json` is
     /// `UNIMPLEMENTED`.
     pub transcoder: Option<Arc<Transcoder>>,
-    /// Optional connection-level WebSocket handshake gate.
-    pub connect_auth: Option<ConnectAuthFn>,
-    /// Optional per-stream authorization (every grpc-webnext stream, both transports).
-    pub stream_auth: Option<StreamAuthFn>,
     /// Allow plain `application/json` / blank content-type to reach *main* gRPC paths
     /// (and blank WS subprotocols to infer their codec). Off by default.
     pub allow_implicit_codec: bool,
@@ -118,8 +107,6 @@ impl Default for ServerConfig {
         Self {
             max_message_bytes: 4 * 1024 * 1024,
             transcoder: None,
-            connect_auth: None,
-            stream_auth: None,
             allow_implicit_codec: false,
             ws_keepalive: None,
             ws_keepalive_timeout: Duration::from_secs(20),
@@ -169,8 +156,6 @@ pub(crate) struct RunConfig {
     pub ws_keepalive: Option<Duration>,
     pub ws_keepalive_timeout: Duration,
     pub allow_implicit_codec: bool,
-    pub connect_auth: Option<ConnectAuthFn>,
-    pub stream_auth: Option<StreamAuthFn>,
     pub admin_reload_path: Option<String>,
     /// Upstream `host:port` for the h2ts byte-pump path (proxy only; `None` in-process).
     pub upstream_authority: Option<String>,
@@ -199,8 +184,6 @@ pub async fn serve_in_process(
         ws_keepalive: config.ws_keepalive,
         ws_keepalive_timeout: config.ws_keepalive_timeout,
         allow_implicit_codec: config.allow_implicit_codec,
-        connect_auth: config.connect_auth,
-        stream_auth: config.stream_auth,
         admin_reload_path: None,
         upstream_authority: None,
     });
@@ -229,8 +212,6 @@ pub async fn serve_proxy(listener: TcpListener, config: ProxyConfig) -> std::io:
         ws_keepalive: config.ws_keepalive,
         ws_keepalive_timeout: config.ws_keepalive_timeout,
         allow_implicit_codec: config.allow_implicit_codec,
-        connect_auth: None,
-        stream_auth: None,
         admin_reload_path: config.admin_reload_path,
         upstream_authority,
     });
@@ -280,20 +261,14 @@ pub async fn bind_and_serve_proxy(
     Ok((addr, handle))
 }
 
-// --- WebSocket handshake helpers (public: used inside a ConnectAuthFn) -------
+// --- WebSocket handshake helpers --------------------------------------------
 
 /// Parse the `Sec-WebSocket-Protocol` request header into its comma-separated tokens.
+/// Used to negotiate the codec / detect the `h2ts` subprotocol at handshake time.
 pub fn ws_subprotocols(headers: &HeaderMap) -> Vec<String> {
     headers
         .get(http::header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
         .unwrap_or_default()
-}
-
-/// Extract a `bearer.<token>` credential a client placed in the WebSocket subprotocol list.
-pub fn ws_bearer_token(headers: &HeaderMap) -> Option<String> {
-    ws_subprotocols(headers)
-        .into_iter()
-        .find_map(|p| p.strip_prefix("bearer.").map(|t| t.to_string()))
 }

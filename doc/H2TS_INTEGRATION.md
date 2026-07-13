@@ -146,8 +146,8 @@ JSON differ only in payload encoding (protobuf frames vs plaintext JSON frames).
 3. **Transport is per-client config** `{ encoding, unary, streaming }` (four valid shapes
    above). `json` locks to `fetch`/`ws`. No per-stream h2ts; per-stream = the `ws` path.
 4. **JSON stays in the proxy.**
-5. **Auth seams** — binary connection auth → the h2ts `accept` handshake; binary per-call
-   auth → gRPC metadata at tonic. The custom (`ws`/json) paths keep today's WS-handshake auth.
+5. **Auth is per-RPC at the router** on every path (h2ts and custom) — a tonic interceptor /
+   the upstream mesh sees the request metadata; there are no grpc-webnext auth hooks.
 
 ## Open
 

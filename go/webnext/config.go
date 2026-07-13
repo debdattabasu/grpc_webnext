@@ -35,8 +35,9 @@ type ServerConfig struct {
 	WSKeepalive        time.Duration
 	WSKeepaliveTimeout time.Duration
 
-	// TODO(spec): Transcoder (for +json), ConnectAuth / StreamAuth hooks — add once
-	// the JSON and auth surfaces are implemented. See ServerConfig in the Rust crate.
+	// TODO(spec): Transcoder (for +json) — add once the JSON surface is implemented. There
+	// are no auth hooks: auth is a gRPC interceptor on the router, like the Rust ServerConfig.
+	// See the Rust crate.
 }
 
 func (c ServerConfig) maxMessageBytes() int {

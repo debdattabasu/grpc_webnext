@@ -88,10 +88,6 @@ class SingleStreamConn {
   ) {
     const codecSub = json ? `${WS_SUBPROTOCOL}+json` : `${WS_SUBPROTOCOL}+proto`;
     const protocols = [WS_SUBPROTOCOL, codecSub];
-    // Connection-level auth: this call's `authorization` metadata rides in the
-    // subprotocol so the server can hard-reject at the handshake (before any frame).
-    const bearer = bearerSubprotocol(options.metadata);
-    if (bearer) protocols.push(bearer);
     this.ws = new WS(url, protocols);
     this.ws.binaryType = "arraybuffer";
     this.ws.addEventListener("open", () => {
@@ -274,23 +270,6 @@ function methodWsUrl(baseUrl: string, path: string): string {
   const url = new URL(path, baseUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
-}
-
-/** RFC 7230 token characters — a WebSocket subprotocol must be a valid token. */
-const SUBPROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-
-/**
- * Derive the connection-level WebSocket credential from a call's `authorization`
- * metadata: strip a `Bearer ` scheme and, if the remaining token is a valid
- * subprotocol token (JWTs and typical API keys are), offer it as `bearer.<token>`.
- * Non-token-safe credentials aren't sent this way — the full metadata still rides
- * in the open frame for per-stream authorization.
- */
-function bearerSubprotocol(metadata: Metadata): string | undefined {
-  const value = metadata.get("authorization")[0];
-  if (typeof value !== "string") return undefined;
-  const token = value.replace(/^Bearer\s+/i, "");
-  return SUBPROTOCOL_TOKEN.test(token) ? `bearer.${token}` : undefined;
 }
 
 /** Metadata -> JSON object (ASCII values only) for a JSON frame. */
