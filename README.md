@@ -4,6 +4,8 @@
 
 **Full bidirectional gRPC in the browser — real HTTP/2, REST, and WebSockets, on the same port as native gRPC.**
 
+[![crates.io](https://img.shields.io/crates/v/grpc-webnext.svg?label=crates.io%20server)](https://crates.io/crates/grpc-webnext)
+[![npm](https://img.shields.io/npm/v/@grpc-webnext/client.svg?label=npm%20client)](https://www.npmjs.com/package/@grpc-webnext/client)
 [![Spec](https://img.shields.io/badge/spec-normative-success.svg)](spec/PROTOCOL.md)
 [![Conformance](https://img.shields.io/badge/conformance-passing-brightgreen.svg)](conformance/)
 &nbsp;·&nbsp;
@@ -111,7 +113,8 @@ per-transport gRPC-semantics fidelity.
 cd node/packages/client && npm install && npm run demo
 ```
 
-**Use the client** — two flavors share one transport (add `codec: "json"` for plaintext):
+**Use the client** — `npm install @grpc-webnext/client`; two flavors share one transport (add
+`codec: "json"` for plaintext):
 
 ```ts
 import { makeClient, makePromiseClient } from "@grpc-webnext/client";
@@ -150,8 +153,8 @@ UPSTREAM=http://localhost:50051 LISTEN=127.0.0.1:8080 cargo run -p grpc-webnext-
 | Component | Location | State |
 |---|---|---|
 | Wire protocol + normative spec | [`proto/`](proto/) · [`spec/PROTOCOL.md`](spec/PROTOCOL.md) | ✅ the contract |
-| Rust server + proxy | [`rust/crates/grpc-webnext`](rust/crates/grpc-webnext) | ✅ h2ts, custom `Frame`, `+json`, REST, deadlines, cancel, size limits, native same-port |
-| TypeScript client (browser + Node) | [`node/packages/client`](node/packages/client) | ✅ h2ts + Fetch + WebSocket, typed codegen, callback + promise APIs |
+| Rust server + proxy&nbsp;·&nbsp;[crates.io](https://crates.io/crates/grpc-webnext) | [`rust/crates/grpc-webnext`](rust/crates/grpc-webnext) | ✅ h2ts, custom `Frame`, `+json`, REST, deadlines, cancel, size limits, native same-port |
+| TypeScript client (browser + Node)&nbsp;·&nbsp;[npm](https://www.npmjs.com/package/@grpc-webnext/client) | [`node/packages/client`](node/packages/client) | ✅ h2ts + Fetch + WebSocket, typed codegen, callback + promise APIs |
 | Conformance suite | [`conformance/`](conformance/) | ✅ language-neutral cases + Rust server + TS driver, run over the real wire |
 | Go in-process server | [`go/webnext`](go/webnext) | ⬜ skeleton (API + router; protocol stubbed) |
 | Node in-process server | [`node/packages/server`](node/packages/server) | ⬜ skeleton |

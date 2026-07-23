@@ -4,7 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "grpc-webnext: serve grpc-webnext (Fetch + WebSocket) over any gRPC service — in-process (wrap a tonic Router) or as a standalone binary proxy in front of an upstream."
+description = "Full bidirectional gRPC for the browser — real HTTP/2 over WebSockets (h2ts), plus JSON, REST, and a single-stream Frame protocol — served in front of any gRPC service, in-process (wrap a tonic Router) or as a standalone proxy."
+readme = "README.md"
+keywords = ["grpc", "grpc-web", "http2", "websocket", "proxy"]
+categories = ["network-programming", "web-programming::http-server", "web-programming::websocket"]
+# The integration tests are dev-only: they depend on the in-workspace `testecho` crate (a path
+# dev-dependency cargo strips on publish), so they can't compile from a crates.io download. Keep
+# them out of the package rather than ship tests that don't build.
+exclude = ["tests/"]
 
 [lib]
 name = "grpc_webnext"

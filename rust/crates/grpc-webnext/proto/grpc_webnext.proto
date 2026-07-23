@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package grpc.webnext.v1;
+
+// ============================================================================
+// grpc-webnext WebSocket wire format — the custom `Frame` path (JSON always;
+// binary when the client selects `streaming: "ws"`).
+//
+// One WebSocket carries exactly ONE gRPC stream. The first frame is a Subscribe
+// (the method comes from the WS URL); then Message / HalfClose / Reset flow on
+// the same socket, and the server replies Header, Message(s), Trailer / Reset.
+// There is no multiplexing — no stream_id, no pool. (The binary default runs
+// real HTTP/2 over h2ts instead; see doc/H2TS_INTEGRATION.md.)
+//
+// Rules (see spec/PROTOCOL.md):
+//   * Exactly one Frame per WebSocket message. No fragmentation.
+//   * No capability negotiation: if a server has a feature disabled and the
+//     client opens a stream that needs it, the server answers with Reset.
+// ============================================================================
+
+// A single WebSocket message. Exactly one field of `kind` is set.
+// Keepalive is NOT an application frame: it uses native WebSocket ping/pong
+// control frames (RFC 6455 §5.5.2), which browsers auto-answer and which generate
+// the wire traffic that keeps idle-timeout proxies from dropping a quiet stream.
+// Field numbers 6/7 held the removed app-level Ping/Pong and are reserved so they
+// are never reused.
+message Frame {
+  reserved 6, 7;
+  reserved "ping", "pong";
+  oneof kind {
+    Subscribe subscribe = 1;   // open the stream (client -> server)
+    Message   message   = 2;   // one gRPC message, either direction
+    HalfClose half_close = 3;  // client done sending (client -> server)
+    Trailer   trailer   = 4;   // stream end + status (server -> client)
+    Reset     reset     = 5;   // abort the stream, either direction
+    Header    header    = 8;   // initial response metadata (server -> client)
+  }
+}
+
+// One metadata entry. Binary values (keys ending in "-bin") use `bin_value`.
+message Metadatum {
+  string key = 1;
+  oneof value {
+    string ascii_value = 2;
+    bytes  bin_value   = 3;
+  }
+}
+
+// Open the stream. The first frame of the connection.
+message Subscribe {
+  string method = 1;                 // e.g. "/pkg.Service/Method"
+  repeated Metadatum headers = 2;    // request metadata
+  uint32 timeout_millis = 3;         // gRPC deadline; 0 = none
+  bytes  initial_payload = 4;        // optional first message (unary-style)
+  bool   json = 5;                   // payloads are JSON (+json codec) not binary
+}
+
+// Initial response metadata, sent once before the first Message (if any).
+message Header {
+  repeated Metadatum headers = 1;
+}
+
+message Message {
+  bytes payload = 1;                 // a single encoded gRPC message
+}
+
+// Client is done sending (a bare marker).
+message HalfClose {}
+
+// Stream completed. Carries gRPC status and trailing metadata.
+message Trailer {
+  uint32 status_code = 1;            // gRPC status code (0 = OK)
+  string status_message = 2;
+  repeated Metadatum trailers = 3;
+}
+
+// Abort the stream. Also used by the server to reject it (e.g. feature disabled).
+message Reset {
+  uint32 status_code = 1;            // gRPC status code (e.g. CANCELLED, UNIMPLEMENTED)
+  string status_message = 2;
+}
