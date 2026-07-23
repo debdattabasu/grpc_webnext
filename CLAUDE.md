@@ -98,8 +98,16 @@ hides.
 
 - The Cargo workspace is in `rust/`, not the repo root — `cargo` commands run from there;
   TS harnesses spawn it via `cwd: <repo>/rust`.
-- `proto/grpc_webnext.proto` at the repo root is the shared contract; each language
-  generates its own bindings (prost, ts-proto, protoc-gen-go).
+- `proto/grpc_webnext.proto` at the repo root is the shared contract and the **only** place
+  to edit it; each language generates its own bindings (prost, ts-proto, protoc-gen-go).
+  Node and Go *check in* their generated code (the proto is a dev-time codegen input), so their
+  packages never ship the `.proto`. Rust generates at **build time** (prost `build.rs` → `OUT_DIR`),
+  so the published crate must physically carry the proto — it keeps a **vendored mirror** at
+  `rust/crates/grpc-webnext/proto/grpc_webnext.proto`. That copy is a generated artifact, not
+  hand-maintained: `build.rs` refreshes it from the root proto on every in-workspace build (and
+  compiles from root there), falling back to the mirror only when there's no repo root (a
+  crates.io build). The `vendored_proto` test backstops them against drift. Bottom line: edit
+  `/proto`, run a Rust build, commit the refreshed mirror alongside.
 - `spec/PROTOCOL.md` is normative; `conformance/` is the cross-language anti-drift guard
   (run every server impl × every client driver over the real wire).
 - gRPC status codes are canonical; WS pre-RPC rejection uses close code `4000 + code`.

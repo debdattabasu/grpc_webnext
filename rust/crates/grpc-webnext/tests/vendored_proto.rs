@@ -1,7 +1,8 @@
 //! The crate ships a vendored copy of the shared wire proto (`proto/grpc_webnext.proto`)
 //! so it builds standalone from crates.io, where the repo root isn't present. In-workspace
-//! that copy must stay byte-identical to the canonical source of truth at the repo root —
-//! this test is the drift guard. On a published crate (no repo root) it is a no-op.
+//! `build.rs` refreshes that copy from the canonical `/proto/grpc_webnext.proto` on every
+//! build, so it should always match the source of truth — this test is the backstop for the
+//! case the refresh couldn't run (e.g. a read-only tree). On a published crate it is a no-op.
 
 #[test]
 fn vendored_proto_matches_repo_root() {
@@ -15,7 +16,8 @@ fn vendored_proto_matches_repo_root() {
         std::fs::read_to_string("proto/grpc_webnext.proto").expect("read vendored proto");
     assert_eq!(
         canonical, vendored,
-        "vendored proto/grpc_webnext.proto drifted from the repo-root source of truth; \
-         re-copy it: `cp proto/grpc_webnext.proto rust/crates/grpc-webnext/proto/`",
+        "vendored proto/grpc_webnext.proto is stale vs the repo-root source of truth. \
+         build.rs auto-refreshes it from /proto on any in-workspace build — run `cargo build` \
+         and commit the updated copy. Always edit the proto at the repo root, never the copy.",
     );
 }

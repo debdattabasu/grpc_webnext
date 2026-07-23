@@ -17,13 +17,28 @@ fn main() {
         .compile_protos(&protos, &["proto"])
         .expect("failed to compile reflection protos");
 
-    // The grpc-webnext wire types (frames, metadata, status). The canonical proto lives at
-    // the repo root (`/proto`), shared across the Rust/Go/Node implementations. In-workspace
-    // we compile that source of truth directly; a crate published to crates.io has no repo
-    // root, so we fall back to the vendored copy under `proto/` (kept identical by the
-    // `vendored_proto` test). Three levels up from this crate reaches the repo root.
-    let (webnext, includes) = if std::path::Path::new("../../../proto/grpc_webnext.proto").exists() {
-        ("../../../proto/grpc_webnext.proto", "../../../proto")
+    // The grpc-webnext wire types (frames, metadata, status). The canonical proto lives at the
+    // repo root (`/proto`), the single source of truth shared across the Rust/Go/Node
+    // implementations — ALWAYS edit it there, never the vendored copy below.
+    //
+    // In-workspace we compile that source of truth directly AND refresh the vendored mirror
+    // (`proto/grpc_webnext.proto`) from it, so the copy is a generated build artifact, not
+    // something hand-maintained. A crate published to crates.io has no repo root, so it falls
+    // back to that committed mirror. The `vendored_proto` test backstops the two against drift.
+    // (Three levels up from this crate reaches the repo root.)
+    let root = "../../../proto/grpc_webnext.proto";
+    let (webnext, includes) = if std::path::Path::new(root).exists() {
+        // Refresh the mirror from the canonical proto, best-effort and only when it differs
+        // (avoids needless writes / rebuild churn). If the tree is read-only we still build
+        // fine from `root`, and the drift test will flag the stale copy.
+        if let Ok(canonical) = std::fs::read(root) {
+            let mirror = std::path::Path::new("proto/grpc_webnext.proto");
+            let stale = std::fs::read(mirror).map(|m| m != canonical).unwrap_or(true);
+            if stale {
+                let _ = std::fs::write(mirror, &canonical);
+            }
+        }
+        (root, "../../../proto")
     } else {
         ("proto/grpc_webnext.proto", "proto")
     };
