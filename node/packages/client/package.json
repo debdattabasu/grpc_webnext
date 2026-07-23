@@ -1,9 +1,35 @@
 {
   "name": "@grpc-webnext/client",
   "version": "0.1.0",
-  "description": "grpc-webnext TypeScript client (browser + node): Fetch unary, WebSocket streaming.",
-  "license": "MIT",
+  "description": "Full bidirectional gRPC client for the browser and Node — real HTTP/2 tunneled over WebSockets via h2ts, plus JSON over Fetch + WebSocket.",
+  "license": "MIT OR Apache-2.0",
+  "author": "Debdatta Basu",
+  "homepage": "https://github.com/debdattabasu/grpc_webnext#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/debdattabasu/grpc_webnext.git",
+    "directory": "node/packages/client"
+  },
+  "bugs": {
+    "url": "https://github.com/debdattabasu/grpc_webnext/issues"
+  },
+  "keywords": [
+    "grpc",
+    "grpc-web",
+    "http2",
+    "websocket",
+    "h2ts",
+    "browser",
+    "rpc",
+    "protobuf",
+    "streaming",
+    "fetch"
+  ],
   "type": "module",
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -14,11 +40,14 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "scripts": {
     "gen": "protoc --plugin=protoc-gen-ts_proto=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=./src/generated --ts_proto_opt=esModuleInterop=true,forceLong=long,outputServices=generic-definitions,useExactTypes=false -I ../../../proto ../../../proto/grpc_webnext.proto",
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "demo": "tsx examples/greeter.ts"

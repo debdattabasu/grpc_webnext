@@ -2,7 +2,7 @@
   "name": "@grpc-webnext/server",
   "version": "0.0.0",
   "description": "grpc-webnext in-process server for Node: serve Fetch + WebSocket in front of a native gRPC server on one port.",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

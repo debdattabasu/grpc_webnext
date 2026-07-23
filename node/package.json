@@ -2,7 +2,7 @@
   "name": "@grpc-webnext/monorepo",
   "version": "0.0.0",
   "private": true,
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "description": "grpc-webnext JavaScript/TypeScript workspace: client (browser + node) and in-process server.",
   "type": "module",
   "workspaces": [
